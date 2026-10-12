@@ -1,9 +1,9 @@
 # 版本号的唯一真相来源。构建脚本、APK、文档都从这里读，不要在两处各写一遍。
 #
-# APP_VERSION  本项目的版本（对应 Git tag v1.0.1）
+# APP_VERSION  本项目的版本（对应 Git tag，发布时保持同名）
 # APP_VERSION_CODE  Android versionCode，必须单调递增
-#                  约定：主版本*10000 + 次版本*100 + 修订号  →  1.0.1 = 10001
+#                  约定：主版本*10000 + 次版本*100 + 修订号  →  1.0.2 = 10002
 # DSH_VERSION  内嵌的 DeepSeek Harness 版本，会拼进 versionName
-APP_VERSION=1.0.2
-APP_VERSION_CODE=10002
+APP_VERSION=1.0.3
+APP_VERSION_CODE=10003
 DSH_VERSION=0.2.0-rc.2

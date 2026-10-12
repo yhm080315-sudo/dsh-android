@@ -454,10 +454,22 @@ public class NodeServer extends Service {
             return;
         }
         try {
-            Process p = new ProcessBuilder(busybox.getAbsolutePath(),
-                    "--install", "-s", binDir().getAbsolutePath())
-                    .redirectErrorStream(true)
-                    .start();
+            ProcessBuilder busyboxCmd = new ProcessBuilder(busybox.getAbsolutePath(),
+                    "--install", "-s", binDir().getAbsolutePath());
+            /*
+             * busybox here is a dynamically linked bionic build: it needs
+             * libbusybox.so.1.38.0 from the payload's usr/lib. This Java process
+             * has no LD_LIBRARY_PATH of its own, so without setting it on the child
+             * the link fails and NOT ONE applet gets installed (rc=1, and the only
+             * trace is a single CANNOT LINK line). A shell has the variable, which
+             * is why testing from a shell never shows this.
+             */
+            try {
+                busyboxCmd.environment().put("LD_LIBRARY_PATH",
+                        new File(runtimeDir(), "usr/lib").getAbsolutePath());
+            } catch (Throwable ignored) {
+            }
+            Process p = busyboxCmd.redirectErrorStream(true).start();
             BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), "UTF-8"));
             String line;
             int lines = 0;
@@ -590,6 +602,9 @@ public class NodeServer extends Service {
      * here is equivalent -- and works without the bundle list, which the harness
      * writes itself.
      */
+    /** Profile rows the app turns off: HMR cannot run without --expose-internals. */
+    private static final String[] DISABLED_ROWS = {"hmr"};
+
     private static final String[][] CLIENT_ROWS = {
             {"dsh-web-mobile", "dsh-web-mobile"},
             {"ui-skin-whale-fantasy-18", "dsh-skin-whale-fantasy"},
@@ -638,9 +653,18 @@ public class NodeServer extends Service {
                 emptyList = false;
                 break;
             }
+            StringBuilder off = new StringBuilder();
+            for (String id : DISABLED_ROWS) {
+                if (existing.contains("id: " + id)) {
+                    continue;
+                }
+                // HMR needs --expose-internals, which a shipping build should not set.
+                // Left on, it fails on every start and adds noise to every bug report.
+                off.append("- id: ").append(id).append("\n  disabled: true\n");
+            }
             String body = emptyList
-                    ? "# Android: client-side presentation rows (added by the app)\n" + rows
-                    : existing + (existing.endsWith("\n") ? "" : "\n") + rows;
+                    ? "# Android: client-side presentation rows (added by the app)\n" + rows + off
+                    : existing + (existing.endsWith("\n") ? "" : "\n") + rows + off;
             java.io.FileOutputStream out = new java.io.FileOutputStream(patch);
             out.write(body.getBytes("UTF-8"));
             out.close();
@@ -768,6 +792,9 @@ public class NodeServer extends Service {
     };
 
     private void restoreUserState() {
+        if (stateMirrorDisabled()) {
+            return;
+        }
         File backup = stateBackupDir();
         if (!backup.isDirectory()) {
             return;
@@ -794,7 +821,15 @@ public class NodeServer extends Service {
         }
     }
 
+    /** Opt-out marker: create this file to stop mirroring state to shared storage. */
+    private boolean stateMirrorDisabled() {
+        return new File(stateBackupDir(), "NO-BACKUP").isFile();
+    }
+
     private void backupUserState() {
+        if (stateMirrorDisabled()) {
+            return;
+        }
         File backup = stateBackupDir();
         if (!backup.mkdirs() && !backup.isDirectory()) {
             return;

@@ -682,7 +682,24 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         if (Build.VERSION.SDK_INT >= 21) {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
-        web.setWebViewClient(new WebViewClient());
+        web.setWebViewClient(new WebViewClient() {
+            /*
+             * The client reports "Failed to fetch" with no status, which cannot be
+             * told apart from a transport failure -- and a batch of failed plugin
+             * fetches at startup was undiagnosable because of that. Record the URL
+             * and the error code for every resource the WebView fails to load.
+             */
+            @Override
+            public void onReceivedError(WebView view, android.webkit.WebResourceRequest request,
+                    android.webkit.WebResourceError error) {
+                if (request == null) {
+                    return;
+                }
+                logLine("web[load-fail] " + request.getUrl()
+                        + " code=" + (error == null ? "?" : error.getErrorCode())
+                        + " " + (error == null ? "" : error.getDescription()));
+            }
+        });
         /*
          * A WebView ignores `<input type="file">` unless the host answers
          * onShowFileChooser -- tapping 上传图片/上传附件 otherwise does nothing at

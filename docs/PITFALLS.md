@@ -37,6 +37,12 @@ bash tools/check-runtime.sh path/to/node
 
 （原先用的是一次性的探测二进制，没有随仓库发布；现在换成了可读、可改、可复现的脚本。）
 
+> **判据是"是否注册 rseq"，不是 libc 品牌。**
+> 本文的结论只对**会注册 rseq 的运行时**成立——glibc 在启动时注册，musl 的 node 在 V8 初始化时注册。
+> 一个非 bionic 的二进制**未必**跑不起来：实测 `@vscode/ripgrep-linux-arm64`（非 bionic）
+> 在应用沙箱里递归搜索完全正常，因为 ripgrep 不碰 rseq。
+> 所以别拿这一条去否掉一个实际上能用的二进制——**跑一次比看品牌可靠**。
+
 **结论**
 
 | 运行时 | 结果 |

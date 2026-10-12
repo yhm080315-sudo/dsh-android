@@ -231,7 +231,17 @@ Termux 路线（Termux + proot-distro）能跑任何 Linux 程序，代价是：
 应用会把 `.credentials.yaml` 镜像到 `/sdcard/DSH/.dsh-state/`，这样**卸载重装后不必重填 API Key**。
 
 代价：那份镜像位于共享存储，其他持有存储权限的应用可以读到。
-**在意密钥安全就删掉那个目录** —— 之后卸载重装需要重新填 Key。这是个取舍，没有两全的选项。
+（另外那行 `chmod 600` 在 FUSE 上是装饰性的 —— 展示的模式不是访问控制。）
+
+**要真的关掉，得留一个开关文件**（每次启动都会重建镜像，所以只删目录是没用的，
+下一次启动就又回来了）：
+
+```bash
+mkdir -p /sdcard/DSH/.dsh-state && touch /sdcard/DSH/.dsh-state/NO-BACKUP
+```
+
+有了这个文件，应用既不镜像也不恢复（`restoreUserState` / `backupUserState` 都会跳过），
+代价是卸载重装后需要重新填 API Key。删掉该文件即恢复镜像行为。
 
 ## 已知限制
 

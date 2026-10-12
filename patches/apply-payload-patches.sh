@@ -82,6 +82,36 @@ patch(
     "P3b 当前代发布改用原子发布",
 )
 
+# ── P3c: publishExclusive 也要能破陈旧锁 ──────────────────────────────────
+# P3 的降级路径在 20 次重试后 return false，而上层把 false 读成「别人已发布」。
+# 若持锁进程被 kill，锁会留下，该会话的发布从此静默停止 —— 与 P11 同源的缺陷。
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """		} catch (error) {
+			if (error?.code !== "EEXIST") throw error;
+			if (attempt >= 20) return false;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}""",
+    """		} catch (error) {
+			if (error?.code !== "EEXIST") throw error;
+			try {
+				const age = Date.now() - (await stat(lock)).mtimeMs;
+				if (age > 30000) {
+					console.error(`[session] breaking a stale publish-lock (${Math.round(age / 1000)}s old): ${lock}`);
+					await rm(lock, { force: true });
+					continue;
+				}
+			} catch {
+				continue;
+			}
+			/* v8 ignore next -- the lock only exists while another publish is mid-flight. */
+			if (attempt >= 20) return false;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}""",
+    "breaking a stale publish-lock",
+    "P3c 会话发布破陈旧锁",
+)
+
 # ── P5: 图片处理不依赖原生 sharp（备用路径）────────────────────────────────
 # 说明：完整的纯 JS 头部解析实现较长，这里只做「不因缺少 sharp 而整体失败」的兜底；
 # 若需要完整的图片能力，请参考 docs/PITFALLS.md 第 5 条自行补全解析器。
@@ -175,14 +205,47 @@ patch(
 				await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
 			}
 			const lockPath = `${absolutePath}.dsh-create.lock`;
+			const STALE_LOCK_MS = 30000;
 			let lock;
 			for (let attempt = 0; ; attempt += 1) {
 				try {
 					lock = await open(lockPath, "wx", 384);
 					break;
 				} catch (lockError) {
-					if (lockError?.code !== "EEXIST" || attempt >= 20) {
-						await throwGuardedCreateFailure(lockError, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+					if (lockError?.code !== "EEXIST") {
+						throw lockError;
+					}
+					/*
+					 * A lock left behind by a killed process would otherwise make this
+					 * filename permanently uncreatable -- and the report would blame the
+					 * target, which does not exist. Break a lock that is old enough that
+					 * no live writer can still hold it (the retry window is 500 ms).
+					 */
+					try {
+						const age = Date.now() - (await stat(lockPath)).mtimeMs;
+						if (age > STALE_LOCK_MS) {
+							console.error(`[dsh-fs] breaking a stale create-lock (${Math.round(age / 1000)}s old): ${lockPath}`);
+							await rm(lockPath, { force: true });
+							continue;
+						}
+					} catch {
+						continue;
+					}
+					if (attempt >= 20) {
+						/* Someone else holds it. Creating is not ours to do -- but only
+						 * if the target really appeared; otherwise publish anyway. */
+						let present;
+						try {
+							present = await inspectPublicationTarget(absolutePath);
+						} catch (inspectError) {
+							if (!isENOENT(inspectError) && !isENOTDIR(inspectError)) throw inspectError;
+						}
+						if (present !== void 0) {
+							await throwGuardedCreateFailure(lockError, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+						}
+						console.error(`[dsh-fs] create-lock held but the target is absent; publishing without it: ${absolutePath}`);
+						await rename(tempPath, absolutePath);
+						return;
 					}
 					await new Promise((resolve) => setTimeout(resolve, 25));
 				}
@@ -230,9 +293,12 @@ def _elf_machine(path):
 def _is_bionic(path):
     """ELF 是否链接到 bionic（Android 的 libc）。
 
-    只看 e_machine 是不够的：`@vscode/ripgrep-linux-arm64` 也是 AArch64，
-    但它是为桌面 Linux 构建的，在应用沙箱里会被 seccomp 杀掉（见 PITFALLS 第 1 条）。
-    bionic 的动态可执行文件带 /system/bin/linker64 解释器路径。
+    只看 e_machine 是不够的：`@vscode/ripgrep-linux-arm64` 也是 AArch64。
+    它其实**能跑**（实测：递归搜索 exit=0，命中 3283 个文件，`--version` 正常）——
+    所以「非 bionic 就会被 seccomp 杀掉」这个因果是错的：判据是**是否注册 rseq**，
+    不是 libc 品牌（ripgrep 不碰 rseq；musl 的 node 死在 V8 初始化）。
+    这里仍然优先选 bionic，因为它是**已被本机验证过**的那一份，属于保守选择，
+    不是因为另一份一定跑不起来。
     """
     try:
         with open(path, "rb") as fh:
@@ -282,9 +348,15 @@ def install_ripgrep_platform_package():
         skipped.append("P12 ripgrep android 平台包（没找到 arm64 的 rg；grep / glob 仍不可用）")
         return
     os.makedirs(os.path.join(target, "bin"))
-    with open(source, "rb") as src, open(os.path.join(target, "bin", "rg"), "wb") as dst:
-        dst.write(src.read())
-    os.chmod(os.path.join(target, "bin", "rg"), 0o755)
+    link_path = os.path.join(target, "bin", "rg")
+    # 符号链接而不是复制：载荷里已经有一份同名二进制，复制等于再存一遍（APK 会大 ~5 MB）。
+    # 注意不能用硬链接（link(2) 在本平台被拒绝，见 P3/P11）。
+    try:
+        os.symlink(os.path.relpath(source, os.path.dirname(link_path)), link_path)
+    except OSError:
+        with open(source, "rb") as src, open(link_path, "wb") as dst:
+            dst.write(src.read())
+        os.chmod(link_path, 0o755)
     # 不写 exports 字段：子路径 @vscode/ripgrep-android-arm64/bin/rg 必须保持可解析。
     with io.open(os.path.join(target, "package.json"), "w", encoding="utf-8") as fh:
         fh.write('{\n  "name": "@vscode/ripgrep-android-arm64",\n  "version": "0.0.0",\n  "private": true\n}\n')
