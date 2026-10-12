@@ -4,6 +4,6 @@
 # APP_VERSION_CODE  Android versionCode，必须单调递增
 #                  约定：主版本*10000 + 次版本*100 + 修订号  →  1.0.1 = 10001
 # DSH_VERSION  内嵌的 DeepSeek Harness 版本，会拼进 versionName
-APP_VERSION=1.0.1
-APP_VERSION_CODE=10001
+APP_VERSION=1.0.2
+APP_VERSION_CODE=10002
 DSH_VERSION=0.2.0-rc.2

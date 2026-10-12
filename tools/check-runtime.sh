@@ -24,6 +24,22 @@ fi
 echo "检查: $BIN"
 echo
 
+# 0) 只在「应用自己那个进程」里有效
+#    seccomp 过滤器是 zygote 给应用进程装上的。在 root shell（Termux + su、adb shell、
+#    内核管理器的 shell）里跑，过滤器根本不存在，glibc / musl 二进制会「看起来正常」
+#    ——那是假阳性，比不测更糟。
+SELINUX_CTX="$(cat /proc/self/attr/current 2>/dev/null | tr -d '\0' || true)"
+case "$SELINUX_CTX" in
+    *untrusted_app*|*isolated_app*) ;;
+    *)
+        echo "  ! 当前 SELinux 域：${SELINUX_CTX:-读不到}"
+        echo "    结论不可信：这里没有应用进程的 seccomp 过滤器。"
+        echo "    请在 DSH 应用内的 shell 里运行（cat /proc/self/attr/current 应含 untrusted_app），"
+        echo "    不要用 su / adb shell / Termux 的 root shell。"
+        echo
+        ;;
+esac
+
 # 1) 启动是否被 seccomp 打断
 VERSION_OUT="$("$BIN" --version 2>&1)"
 RC=$?

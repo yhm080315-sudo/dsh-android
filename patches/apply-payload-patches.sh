@@ -148,6 +148,151 @@ patch(
     "P9  裸包名按 profile 解析",
 )
 
+# ── P11: 文件工具的「新建」在本平台必然失败 ────────────────────────────────
+# link(2) 被 app 域拒绝（P3 记的就是这件事），但 writeFileAtomic 在「新建且不许覆盖」
+# 时用硬链接做发布，于是 Write 工具在任何路径上都创建不了新文件；覆盖已存在文件走
+# rename，所以坏的只有「新建」——症状很像权限问题，实际是选错了系统调用。
+# 修法与 P3 同源：锁文件给独占，rename 给原子，两者都不放弃。
+patch(
+    "@deepseek-ai/dsh-fs-local/lib/index.js",
+    """		if (createIfAbsent !== void 0) try {
+			await linkFile(tempPath, absolutePath);
+		} catch (error) {
+			await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+		}""",
+    """		/*
+		 * Android: an app domain is denied link(2), so the no-replace publication
+		 * above can never succeed there. A lock file keeps the exclusivity and the
+		 * rename keeps the atomicity -- the same serialization
+		 * dsh-session-persistence-jsonl uses for its logs. copyFile would keep
+		 * neither: it truncates the target and fills it over time.
+		 */
+		if (createIfAbsent !== void 0) try {
+			await linkFile(tempPath, absolutePath);
+		} catch (error) {
+			const code = error?.code;
+			if (code !== "EACCES" && code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EXDEV") {
+				await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+			}
+			const lockPath = `${absolutePath}.dsh-create.lock`;
+			let lock;
+			for (let attempt = 0; ; attempt += 1) {
+				try {
+					lock = await open(lockPath, "wx", 384);
+					break;
+				} catch (lockError) {
+					if (lockError?.code !== "EEXIST" || attempt >= 20) {
+						await throwGuardedCreateFailure(lockError, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+					}
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
+			}
+			try {
+				let existing;
+				try {
+					existing = await inspectPublicationTarget(absolutePath);
+				} catch (inspectError) {
+					if (!isENOENT(inspectError) && !isENOTDIR(inspectError)) throw inspectError;
+				}
+				if (existing !== void 0) {
+					const conflict = new Error(`EEXIST: ${absolutePath} already exists`);
+					conflict.code = "EEXIST";
+					await throwGuardedCreateFailure(conflict, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+				}
+				await rename(tempPath, absolutePath);
+			} finally {
+				await lock.close().catch(() => {});
+				await rm(lockPath, { force: true }).catch(() => {});
+			}
+		}""",
+    "dsh-create.lock",
+    "P11 新建文件改用锁 + rename 发布",
+)
+
+# ── P12: Grep / Glob 在 android-arm64 上找不到 ripgrep ─────────────────────
+# @vscode/ripgrep 按 `@vscode/ripgrep-${process.platform}-${arch}` 解析二进制，
+# 在 Android 上就是 ripgrep-android-arm64——npm 不发布这个平台包，import 直接抛错，
+# resolveRgPath() 跟着 reject，于是 grep / glob 每次调用都报 "ripgrep launch failed"。
+# 这里把载荷里已有的 arm64 rg 放成那个缺失的平台包（自带 bionic rg 优先）。
+# 注意：必须建在真实的 node_modules/@vscode 下——node 按包的 realpath 解析。
+def _elf_machine(path):
+    """ELF e_machine，或 None（非 ELF / 读不到）。183 = AArch64。"""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return None
+    if len(head) < 20 or head[:4] != b"\x7fELF":
+        return None
+    return head[18] | (head[19] << 8)
+
+
+def _is_bionic(path):
+    """ELF 是否链接到 bionic（Android 的 libc）。
+
+    只看 e_machine 是不够的：`@vscode/ripgrep-linux-arm64` 也是 AArch64，
+    但它是为桌面 Linux 构建的，在应用沙箱里会被 seccomp 杀掉（见 PITFALLS 第 1 条）。
+    bionic 的动态可执行文件带 /system/bin/linker64 解释器路径。
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(200000)
+    except OSError:
+        return False
+    return b"/system/bin/linker64" in data or b"/system/bin/linker" in data
+
+
+def install_ripgrep_platform_package():
+    vendor = os.path.join(root, "@vscode")
+    target = os.path.join(vendor, "ripgrep-android-arm64")
+    if os.path.isdir(target):
+        skipped.append("P12 ripgrep android 平台包（已存在）")
+        return
+    if not os.path.isdir(vendor):
+        skipped.append("P12 ripgrep android 平台包（没有 @vscode 目录）")
+        return
+    source = None
+    # 优先用载荷自带的 bionic rg：它已被真机验证能在这个沙箱里跑。
+    for rel in ("../usr/bin/rg", "../../usr/bin/rg"):
+        candidate = os.path.normpath(os.path.join(root, rel))
+        if _elf_machine(candidate) == 183 and _is_bionic(candidate):
+            source = candidate
+            break
+    # 其次才是 @vscode/ripgrep-* 里的平台包，而且同样要求是 bionic。
+    if source is None:
+        for name in sorted(os.listdir(vendor)):
+            if not name.startswith("ripgrep-"):
+                continue
+            candidate = os.path.join(vendor, name, "bin", "rg")
+            if _elf_machine(candidate) == 183 and _is_bionic(candidate):
+                source = candidate
+                break
+    # 最后才退而求其次：只要 AArch64 就用（可能跑不起来，明确警告）。
+    if source is None:
+        for name in sorted(os.listdir(vendor)):
+            if not name.startswith("ripgrep-"):
+                continue
+            candidate = os.path.join(vendor, name, "bin", "rg")
+            if _elf_machine(candidate) == 183:
+                source = candidate
+                print("  警告  P12 用的是非 bionic 的 rg（%s），在设备上可能被 seccomp 杀掉"
+                      % name)
+                break
+    if source is None:
+        skipped.append("P12 ripgrep android 平台包（没找到 arm64 的 rg；grep / glob 仍不可用）")
+        return
+    os.makedirs(os.path.join(target, "bin"))
+    with open(source, "rb") as src, open(os.path.join(target, "bin", "rg"), "wb") as dst:
+        dst.write(src.read())
+    os.chmod(os.path.join(target, "bin", "rg"), 0o755)
+    # 不写 exports 字段：子路径 @vscode/ripgrep-android-arm64/bin/rg 必须保持可解析。
+    with io.open(os.path.join(target, "package.json"), "w", encoding="utf-8") as fh:
+        fh.write('{\n  "name": "@vscode/ripgrep-android-arm64",\n  "version": "0.0.0",\n  "private": true\n}\n')
+    applied.append("P12 ripgrep android 平台包（源：" + os.path.relpath(source, root) + "）")
+
+
+install_ripgrep_platform_package()
+
 print()
 for line in applied:
     print(f"  已应用  {line}")

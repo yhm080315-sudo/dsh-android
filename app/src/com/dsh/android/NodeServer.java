@@ -939,8 +939,12 @@ public class NodeServer extends Service {
                 + "\n"
                 + "## Shell\n"
                 + "\n"
-                + "- `bash` is available; coreutils come from busybox (`ls`, `cp`, `mv`, `grep`, `sed`,\n"
-                + "  `awk`, `find`, `xargs`, `tar`, ...). `rg` (ripgrep) is installed.\n"
+                + "- `bash` is available. `usr/bin` ships busybox plus standalone coreutils\n"
+                + "  (`ls`, `cp`, `mv`, `cat`, `head`, `tail`, `sort`, `wc`, ...) -- but NOT\n"
+                + "  `grep`/`sed`/`awk`/`find`/`xargs`/`tar`, which fall through to Android's toybox.\n"
+                + "  toybox `grep` has no BRE alternation: `grep 'a\\|b'` returns ZERO matches with\n"
+                + "  exit status 0 -- a silent false negative. Use `grep -E`, or `rg`.\n"
+                + "- `rg` (ripgrep) is at `usr/bin/rg`.\n"
                 + "- `busybox --list` prints every available applet.\n"
                 + "- There is no python, no compilers and no package manager on this device.\n"
                 + "- Terminals are not interactive: run one-shot commands, never a REPL or an editor.\n"
@@ -964,8 +968,10 @@ public class NodeServer extends Service {
                 + "  `/device/start?component=`, `/device/top`, `/device/ocr`, `/device/status`.\n"
                 + "- It is bound to 127.0.0.1 **and requires a token** (loopback is not isolation on\n"
                 + "  Android -- any app can reach it). Pass it as `?token=` or an `X-Device-Token`\n"
-                + "  header. The token is in the environment as `DSH_DEVICE_TOKEN` and in\n"
-                + "  `$DSH_HOME/.device-token`.\n"
+                + "  header. The token is in `$DSH_HOME/.device-token` (mode 0600) -- read it there.\n"
+                + "  It is NOT in the shell environment: the shell executor discards ambient `DSH_*`\n"
+                + "  values and injects only its own registry, so `$DSH_DEVICE_TOKEN` expands to\n"
+                + "  nothing. Easiest client is `dshdev` (tools/dshdev.js).\n"
                 + "- Most endpoints act through `su`, so they need root to have been granted.\n";
         try {
             if (target.isFile()) {

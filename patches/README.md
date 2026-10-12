@@ -18,6 +18,8 @@ bash patches/apply-payload-patches.sh <目录>      # 或指定任意 runtime �
 | P3 | 会话发布改为「锁 + rename」原子发布 | `dsh-session-persistence-jsonl/lib/index.js` |
 | P4 | 目录 fsync 容忍权限错误 | `dsh-attachment-local/lib/index.js` |
 | P9 | 裸包名按 profile 解析 | `cordis-plugin-loader/lib/index.js` |
+| P11 | 新建文件改用「锁 + rename」发布（`link` 被 app 域拒绝） | `dsh-fs-local/lib/index.js` |
+| P12 | 补上缺失的 `@vscode/ripgrep-android-arm64` 平台包 | `node_modules/@vscode/`（新增目录） |
 
 ## 未自动覆盖（需手工处理，见 docs/PITFALLS.md）
 

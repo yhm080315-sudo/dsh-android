@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dsh.android"
-    android:versionCode="10001"
-    android:versionName="1.0.1+dsh.0.2.0-rc.2">
+    android:versionCode="10002"
+    android:versionName="1.0.2+dsh.0.2.0-rc.2">
 
     <!-- targetSdk 28 keeps the pre-Android-10 exec-from-app-data policy that the
          bundled runtime depends on: the harness runs ELF binaries out of the

@@ -100,3 +100,12 @@ for sentinel in \
   fi
 done
 echo "  payload complete: $(find "$STAGE/runtime" -type f | wc -l) files"
+
+# dshdev: 设备桥客户端。/usr/bin/env 在 Android 上不存在，所以 node 脚本不能靠
+# shebang 直接执行 —— 装成 usr/bin/dshdev.js 再加一个 sh 启动器。
+if [ -f "$HERE/tools/dshdev.js" ]; then
+  cp -f "$HERE/tools/dshdev.js" "$STAGE/runtime/usr/bin/dshdev.js"
+  cp -f "$HERE/tools/dshdev-launcher.sh" "$STAGE/runtime/usr/bin/dshdev"
+  chmod 755 "$STAGE/runtime/usr/bin/dshdev" "$STAGE/runtime/usr/bin/dshdev.js"
+  echo "  bin  dshdev (device bridge client)"
+fi

@@ -68,7 +68,7 @@ APK 的 `versionName` 把两层都带上：**`1.0.1+dsh.0.2.0-rc.2`**，
 ```
 
 ```bash
-apksigner verify --print-certs DSH-Android-v55.apk | grep "SHA-256 digest"
+apksigner verify --print-certs DSH-Android-v1.0.1-dsh0.2.0-rc.2.apk | grep "SHA-256 digest"
 ```
 
 ⚠️ **装过官方 APK 的人无法用自己构建的 APK 覆盖升级**——签名不同，Android 会拒绝安装，

@@ -383,6 +383,86 @@ const resolved = pathToFileURL(createRequire(baseUrl).resolve(name)).href;
 **教训**：**注释里的安全声明不算数**。要说某个接口是安全的，就得能说出它靠什么阻止了谁——
 说不出，那它就是没设防。
 
+## 13. 硬链接被拒，这次打在文件工具上（Write 建不了新文件）
+
+**现象**：agent 用 Write 工具创建任何新文件都失败，`/sdcard` 和应用私有目录一样：
+
+```
+EACCES: permission denied, link
+  '/sdcard/x/.probe.txt.22272.<uuid>.tmpdir/probe.txt.tmp' -> '/sdcard/x/probe.txt'
+```
+
+Edit、以及对**已存在文件**的 Write 都正常——所以看起来像"权限问题"，
+实际是"新建"这一条路径坏了。而系统提示还在告诉模型"优先写文件而不是长回复"。
+
+**根因**：`dsh-fs-local` 的 `writeFileAtomic()` 有两条发布路径：
+
+| 分支 | 发布手段 | Android |
+|---|---|---|
+| `createIfAbsent`（新建、不许覆盖） | `link(2)` | ❌ app 域拒绝 |
+| 覆盖已有文件 | `rename(2)` | ✅ |
+
+第 3 条记的是同一个系统调用被拒，但当时的修法只落在会话与附件两个模块上，
+文件工具这条路没打补丁。这不是权限配置问题：同一路径用 `su` 执行就成功
+（`u:r:ksu` 对 `u:r:untrusted_app_27`）。
+
+**修法**：锁文件（独占）+ `rename`（原子），与第 3 条同源（补丁 P11）：
+`open(lock, "wx")` 抢锁，检查目标不存在后 `rename` 发布。
+两个保证都不放弃——**不要退化成 `copyFile`**，那正是第 3 条用一整节讲清楚的错。
+
+**教训**：一个系统调用被平台拒绝，是一个**对该平台所有调用点都成立**的结论。
+修完当下报错的那一处，应该顺手把同一调用在代码里的其它落点搜一遍——
+第 3 条修完时，文件工具这一处就已经是定时炸弹了。
+
+---
+
+## 14. 平台没有的 optionalDependency，会让整套工具静默失效（grep / glob）
+
+**现象**：Grep 和 Glob 两个工具每次调用都失败，且没有任何别的线索：
+
+```
+grep could not start its search command (ripgrep launch failed)
+```
+
+**根因**：DSH 自带 ripgrep（"不依赖系统 `rg`"），用 `@vscode/ripgrep` 解析：
+
+```js
+const platformPkg = `@vscode/ripgrep-${process.platform}-${arch}`;
+```
+
+Android 上算出来是 **`@vscode/ripgrep-android-arm64`，npm 不发布这个平台包**，
+`import("@vscode/ripgrep")` 直接抛：
+
+```
+Could not find @vscode/ripgrep-android-arm64.
+Ensure optionalDependencies are installed for this platform (android-arm64).
+```
+
+`resolveRgPath()` 跟着 reject，于是 grep / glob 两个工具在真机上 100% 不可用。
+而载荷里其实有两个能跑的 rg：`@vscode/ripgrep-linux-arm64/bin/rg`（真机实测 `ripgrep 15.0.0`）
+和 `usr/bin/rg`（Termux bionic，15.2.0）——**它们从来没被用上，因为解析那一步就抛了。**
+
+**修法**（补丁 P12）：把可用的 arm64 rg 放成那个缺失的平台包：
+
+```
+node_modules/@vscode/ripgrep-android-arm64/bin/rg          ← 复制自 usr/bin/rg
+node_modules/@vscode/ripgrep-android-arm64/package.json    ← 不要写 exports 字段
+```
+
+**两个坑**
+
+1. 必须建在**真实的** `node_modules/@vscode/` 下。node 解析子路径时用的是包的
+   realpath，在 profile 的符号链接视图里补没有用——这是第 9 条"解析基准"问题的又一个实例。
+2. 构建机上 `npm install` 装的是**构建机**的平台包。若构建机是 x86_64，载荷里只有
+   `ripgrep-linux-x64`，那个二进制在手机上跑不了。P12 因此校验 ELF 头
+   （`e_machine == 183`，AArch64），不合格就退回用载荷自带的 bionic `rg`。
+
+**教训**："不依赖系统二进制"这个设计的隐含前提是：那个自带二进制**在目标平台上存在**。
+交叉打包时 `optionalDependencies` 是按构建机选的，而运行时却在手机上——
+这类错不会报"平台不支持"，只会报"启动失败"。
+
+---
+
 ## 排查方法论
 
 这份清单里大部分条目是**花了多轮才定位**的，共同教训有三条：
