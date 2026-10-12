@@ -465,9 +465,13 @@ public class NodeServer extends Service {
              * is why testing from a shell never shows this.
              */
             try {
-                busyboxCmd.environment().put("LD_LIBRARY_PATH",
-                        new File(runtimeDir(), "usr/lib").getAbsolutePath());
-            } catch (Throwable ignored) {
+                String libDir = new File(runtimeDir(), "usr/lib").getAbsolutePath();
+                busyboxCmd.environment().put("LD_LIBRARY_PATH", libDir);
+                // Say it out loud: without this the child cannot link libbusybox.so and
+                // zero applets get installed, while the only trace is one CANNOT LINK line.
+                logLine("busybox applets: LD_LIBRARY_PATH=" + libDir);
+            } catch (Throwable t) {
+                logLine("busybox applets: could not set LD_LIBRARY_PATH: " + t);
             }
             Process p = busyboxCmd.redirectErrorStream(true).start();
             BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), "UTF-8"));
