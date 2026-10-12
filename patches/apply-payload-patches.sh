@@ -232,8 +232,19 @@ patch(
 						continue;
 					}
 					if (attempt >= 20) {
-						/* Someone else holds it. Creating is not ours to do -- but only
-						 * if the target really appeared; otherwise publish anyway. */
+						/*
+						 * The lock is held. Only bypass it when it is old enough that no live
+						 * writer can still be inside the (tiny) inspect-and-rename window --
+						 * otherwise two writers would both rename and the later one would
+						 * silently overwrite the earlier, which is precisely what link(2)
+						 * exclusivity prevented.
+						 */
+						let heldMs = 0;
+						try {
+							heldMs = Date.now() - (await stat(lockPath)).mtimeMs;
+						} catch {
+							heldMs = 0;
+						}
 						let present;
 						try {
 							present = await inspectPublicationTarget(absolutePath);
@@ -243,8 +254,21 @@ patch(
 						if (present !== void 0) {
 							await throwGuardedCreateFailure(lockError, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
 						}
-						console.error(`[dsh-fs] create-lock held but the target is absent; publishing without it: ${absolutePath}`);
-						await rename(tempPath, absolutePath);
+						if (heldMs < 2000) {
+							/* Fresh lock, absent target: someone is mid-publish. Say so clearly
+							 * instead of guessing, and don't touch their lock. */
+							const busy = new Error(`EBUSY: another writer holds ${lockPath} (${Math.round(heldMs)} ms)`);
+							busy.code = "EBUSY";
+							throw busy;
+						}
+						console.error(`[dsh-fs] create-lock abandoned for ${Math.round(heldMs / 1000)}s; taking it over: ${absolutePath}`);
+						await rm(lockPath, { force: true });
+						try {
+							await rename(tempPath, absolutePath);
+						} finally {
+							/* Rename consumed the staging file; the lock is gone too, so the
+							 * next writer starts clean. */
+						}
 						return;
 					}
 					await new Promise((resolve) => setTimeout(resolve, 25));

@@ -641,7 +641,21 @@ public class NodeServer extends Service {
                 rows.append("- insert:\n    - id: ").append(row[0])
                         .append("\n      name: '").append(row[1]).append("'\n");
             }
-            if (rows.length() == 0) {
+            /*
+             * Compute the rows to switch off BEFORE deciding whether anything needs
+             * writing: the four insert rows are present from the first launch onwards,
+             * so an early return here would mean this code never runs at all -- which
+             * is exactly what happened once, leaving HMR to fail on every start.
+             */
+            StringBuilder off = new StringBuilder();
+            for (String id : DISABLED_ROWS) {
+                if (existing.contains("id: " + id)) {
+                    continue;
+                }
+                // HMR needs --expose-internals, which a shipping build should not set.
+                off.append("- id: ").append(id).append("\n  disabled: true\n");
+            }
+            if (rows.length() == 0 && off.length() == 0) {
                 logLine("profile patch: all plugin rows present");
                 return;
             }
@@ -656,15 +670,6 @@ public class NodeServer extends Service {
                 }
                 emptyList = false;
                 break;
-            }
-            StringBuilder off = new StringBuilder();
-            for (String id : DISABLED_ROWS) {
-                if (existing.contains("id: " + id)) {
-                    continue;
-                }
-                // HMR needs --expose-internals, which a shipping build should not set.
-                // Left on, it fails on every start and adds noise to every bug report.
-                off.append("- id: ").append(id).append("\n  disabled: true\n");
             }
             String body = emptyList
                     ? "# Android: client-side presentation rows (added by the app)\n" + rows + off
