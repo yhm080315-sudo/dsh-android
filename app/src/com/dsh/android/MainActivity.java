@@ -49,6 +49,8 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     /** Set while the system picker is open for a page's file input. */
     private android.webkit.ValueCallback<Uri[]> pendingFileCallback;
     private static final int REQUEST_FILE_CHOOSER = 4001;
+    /** When the WebView attached, to timestamp resource failures against it. */
+    private volatile long webAttachedAt;
     private File pendingApk;
     private WebView web;
     private boolean webAttached;
@@ -695,7 +697,17 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                 if (request == null) {
                     return;
                 }
-                logLine("web[load-fail] " + request.getUrl()
+                /*
+                 * A batch of plugin fetches fails at every startup and nothing explains
+                 * it: the server answers the same URLs with 200 when asked directly, so
+                 * it looks like the WebView aborts them while mounting. Recording
+                 * whether it is a main-frame request and how long after the WebView
+                 * attached separates "transient startup abort" from "persistent
+                 * failure" -- which is the only thing missing to root-cause it.
+                 */
+                long since = webAttachedAt == 0 ? -1 : System.currentTimeMillis() - webAttachedAt;
+                logLine("web[load-fail] main=" + request.isForMainFrame()
+                        + " t+" + since + "ms " + request.getUrl()
                         + " code=" + (error == null ? "?" : error.getErrorCode())
                         + " " + (error == null ? "" : error.getDescription()));
             }
@@ -755,6 +767,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         webAttached = true;
+        webAttachedAt = System.currentTimeMillis();
         web.loadUrl(url);
         logPanel.setVisibility(View.GONE);
         if (logChip != null) {

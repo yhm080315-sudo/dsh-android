@@ -75,7 +75,10 @@ android  deepseek  dsh  ai-agent  nodejs  bionic  termux  webview  android-app  
 
 1. 改 `VERSION`（`APP_VERSION` / `APP_VERSION_CODE` / `DSH_VERSION`）
 2. 构建：`install-dsh.sh` → `stage-bionic-assets.sh` → `build-app.sh`
-3. **用 tag 指向的那个提交重新构建一次，比对 APK 摘要** —— 否则发布物与源码可能不一致。
+3. **跑 `bash scripts/check-tag.sh`** —— 它做四件事：tag 是否指向当前提交、
+   tag 里的 VERSION 是否与 tag 名一致、manifest 是否与 VERSION 同步、工作区是否干净。
+   这个校验是**机械的**，因为同类错误本项目已经犯过三次，每次都是手工疏忽。
+4. **用 tag 指向的那个提交重新构建一次，比对 APK 摘要** —— 否则发布物与源码可能不一致。
    这个项目就犯过：v1.0.1 的 tag 指向 `0c0b1414`，而实际发布的 APK 里含 `4ba31820` 才有的改动。
 4. 提交、打 tag、推
 5. 建 Release，上传 APK，附上 GPL 对应源码链接
