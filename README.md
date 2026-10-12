@@ -47,7 +47,7 @@ bash scripts/build-app.sh
 
 ### 发布的 APK 与版本号
 
-Git tag（`v1.0.0`）是**发布批次**；APK 自身的版本号是 `versionCode 54` / `versionName 0.54`，
+Git tag（`v1.0.1`）是**发布批次**；APK 自身的版本号是 `versionCode 55` / `versionName 0.55`，
 以 `app/AndroidManifest.xml` 为准，`versionName` 由构建脚本从 `versionCode` 推导。
 
 **已发布 APK 的签名证书 SHA-256（用于校验下载物真伪）：**
@@ -57,7 +57,7 @@ Git tag（`v1.0.0`）是**发布批次**；APK 自身的版本号是 `versionCod
 ```
 
 ```bash
-apksigner verify --print-certs DSH-Android-v54.apk | grep "SHA-256 digest"
+apksigner verify --print-certs DSH-Android-v55.apk | grep "SHA-256 digest"
 ```
 
 ⚠️ **装过官方 APK 的人无法用自己构建的 APK 覆盖升级**——签名不同，Android 会拒绝安装，

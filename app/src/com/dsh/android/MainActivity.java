@@ -3,6 +3,8 @@ package com.dsh.android;
 import android.app.Activity;
 import java.io.File;
 import android.content.Intent;
+import android.net.Uri;
+import java.io.IOException;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -44,6 +46,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     private Button rootButton;
     private Button resumeButton;
     private TextView logChip;
+    /** Set while the system picker is open for a page's file input. */
+    private android.webkit.ValueCallback<Uri[]> pendingFileCallback;
+    private static final int REQUEST_FILE_CHOOSER = 4001;
     private File pendingApk;
     private WebView web;
     private boolean webAttached;
@@ -678,6 +683,57 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
         web.setWebViewClient(new WebViewClient());
+        /*
+         * A WebView ignores `<input type="file">` unless the host answers
+         * onShowFileChooser -- tapping 上传图片/上传附件 otherwise does nothing at
+         * all, with no error anywhere. Hand the request to the system picker and
+         * pass the chosen document back to the page.
+         */
+        web.setWebChromeClient(new android.webkit.WebChromeClient() {
+            @Override
+            public boolean onConsoleMessage(android.webkit.ConsoleMessage message) {
+                /*
+                 * The client reports its failures to the browser console, which an
+                 * app log never sees -- an on-device upload failure was therefore
+                 * invisible from here. Keep the errors (and anything about uploads)
+                 * so they land next to the harness output.
+                 */
+                String text = message == null ? null : message.message();
+                if (text == null) {
+                    return true;
+                }
+                boolean noisy = message.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR
+                        || text.contains("[upload]")
+                        || text.contains("upload")
+                        || text.contains("Failed")
+                        || text.contains("failed");
+                if (noisy) {
+                    logLine("web[" + message.messageLevel() + "] " + text
+                            + " (" + message.sourceId() + ":" + message.lineNumber() + ")");
+                }
+                return true;
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView view,
+                    android.webkit.ValueCallback<Uri[]> callback,
+                    FileChooserParams params) {
+                if (pendingFileCallback != null) {
+                    pendingFileCallback.onReceiveValue(null);
+                }
+                pendingFileCallback = callback;
+                try {
+                    Intent pick = params.createIntent();
+                    pick.addCategory(Intent.CATEGORY_OPENABLE);
+                    startActivityForResult(pick, REQUEST_FILE_CHOOSER);
+                    return true;
+                } catch (Throwable t) {
+                    logLine("file chooser failed: " + t);
+                    pendingFileCallback = null;
+                    return false;
+                }
+            }
+        });
         web.setBackgroundColor(0xFF101418);
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -772,6 +828,128 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             return true;
         }
         return super.onKeyDown(keyCode, event);
+    }
+
+    // ------------------------------------------------------- file chooser
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        if (request == REQUEST_FILE_CHOOSER) {
+            Uri[] chosen = null;
+            if (result == RESULT_OK && data != null) {
+                java.util.List<Uri> picked = new java.util.ArrayList<Uri>();
+                if (data.getClipData() != null) {
+                    int count = data.getClipData().getItemCount();
+                    for (int i = 0; i < count; i++) {
+                        picked.add(data.getClipData().getItemAt(i).getUri());
+                    }
+                } else if (data.getData() != null) {
+                    picked.add(data.getData());
+                }
+                java.util.List<Uri> local = new java.util.ArrayList<Uri>();
+                for (Uri uri : picked) {
+                    local.add(stagePickedFile(uri));
+                }
+                if (!local.isEmpty()) {
+                    chosen = local.toArray(new Uri[0]);
+                }
+            } else {
+                logLine("pick: cancelled or empty result");
+            }
+            if (pendingFileCallback != null) {
+                pendingFileCallback.onReceiveValue(chosen);
+                pendingFileCallback = null;
+            }
+            return;
+        }
+        super.onActivityResult(request, result, data);
+    }
+
+    /**
+     * Copy a picked document into the app's own cache and hand the page a
+     * file:// URI.
+     *
+     * A WebView can fail to read a content:// URI straight from the picker: the
+     * page then receives an empty File and the upload silently does nothing,
+     * with nothing in any log. Reading the stream here (the app already holds
+     * storage access) and staging a local copy removes that dependency, and
+     * leaves a name and byte count behind for the next diagnosis.
+     */
+    private Uri stagePickedFile(Uri source) {
+        java.io.InputStream in = null;
+        java.io.OutputStream out = null;
+        try {
+            String name = null;
+            String mime = getContentResolver().getType(source);
+            // Prefer the provider's display name: the raw path segment is often a
+            // bare number, and the attachment pipeline keys on the file extension.
+            android.database.Cursor cursor = null;
+            try {
+                cursor = getContentResolver().query(source, null, null, null, null);
+                if (cursor != null && cursor.moveToFirst()) {
+                    int column = cursor.getColumnIndex("_display_name");
+                    if (column >= 0) {
+                        name = cursor.getString(column);
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (cursor != null) {
+                    cursor.close();
+                }
+            }
+            if (name == null || name.isEmpty()) {
+                name = source.getLastPathSegment();
+                if (name != null) {
+                    int slash = name.lastIndexOf('/');
+                    name = slash >= 0 ? name.substring(slash + 1) : name;
+                }
+            }
+            if (name == null || name.isEmpty()) {
+                name = "upload-" + System.currentTimeMillis();
+            }
+            if (name.indexOf('.') < 0 && mime != null) {
+                name = name + "." + mime.substring(mime.indexOf('/') + 1).replace("jpeg", "jpg");
+            }
+            File dir = new File(getCacheDir(), "uploads");
+            if (!dir.mkdirs() && !dir.isDirectory()) {
+                logLine("pick: cannot create cache dir");
+                return source;
+            }
+            File target = new File(dir, name);
+            in = getContentResolver().openInputStream(source);
+            if (in == null) {
+                logLine("pick: no stream for " + source);
+                return source;
+            }
+            out = new java.io.FileOutputStream(target);
+            byte[] buf = new byte[1 << 16];
+            long total = 0;
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                total += n;
+            }
+            out.flush();
+            logLine("pick: staged " + name + " (" + total + " bytes)");
+            return Uri.fromFile(target);
+        } catch (Throwable t) {
+            logLine("pick: staging failed, passing the original URI (" + t + ")");
+            return source;
+        } finally {
+            try {
+                if (in != null) {
+                    in.close();
+                }
+            } catch (IOException ignored) {
+            }
+            try {
+                if (out != null) {
+                    out.close();
+                }
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     @Override

@@ -183,6 +183,86 @@ public class NodeServer extends Service {
         return new File(runtimeDir(), ".extracted");
     }
 
+    /**
+     * Install plugin tarballs left in shared storage.
+     *
+     * The phone has no npm, so a plugin can only arrive as a tarball. Dropping
+     * one in /sdcard/DSH/plugins installs it into the profile, where it survives
+     * app updates -- previous installs went into the runtime and were lost on
+     * every upgrade.
+     */
+    private void installSideLoadedPlugins(File web) {
+        File modules = new File(web, "node_modules");
+        File inbox = new File("/sdcard/DSH/plugins");
+        File[] tarballs = inbox.listFiles();
+        if (tarballs == null || tarballs.length == 0) {
+            return;
+        }
+        for (File tarball : tarballs) {
+            if (!tarball.getName().endsWith(".tgz")) {
+                continue;
+            }
+            File staging = new File(getCacheDir(), "plugin-" + System.currentTimeMillis());
+            try {
+                InputStream raw = new java.io.FileInputStream(tarball);
+                TarExtractor.Counting in = new TarExtractor.Counting(new GZIPInputStream(raw, 1 << 16));
+                final int[] count = {0};
+                TarExtractor.extract(in, staging, new TarExtractor.Progress() {
+                    @Override
+                    public void onEntry(String name) {
+                        count[0]++;
+                    }
+                });
+                in.close();
+                // npm tarballs wrap everything in a top-level "package/" directory
+                File root = new File(staging, "package");
+                if (!root.isDirectory()) {
+                    root = staging;
+                }
+                File manifest = new File(root, "package.json");
+                String name = readPackageName(manifest);
+                if (name == null) {
+                    logLine("plugin " + tarball.getName() + ": no package name, skipped");
+                    continue;
+                }
+                File target = new File(modules, name);
+                if (target.exists()) {
+                    logLine("plugin " + name + " already installed");
+                    continue;
+                }
+                Process p = new ProcessBuilder("/system/bin/cp", "-a",
+                        root.getAbsolutePath(), target.getAbsolutePath())
+                        .redirectErrorStream(true).start();
+                int rc = waitForExit(p, 120000);
+                logLine("installed plugin " + name + " from " + tarball.getName()
+                        + " (" + count[0] + " entries, rc=" + rc + ")");
+            } catch (Throwable t) {
+                logLine("plugin " + tarball.getName() + " failed: " + t);
+            } finally {
+                deleteRecursive(staging);
+            }
+        }
+    }
+
+    /** The "name" field of a package.json, or null when it cannot be read. */
+    private String readPackageName(File manifest) {
+        try {
+            if (!manifest.isFile()) {
+                return null;
+            }
+            byte[] buf = new byte[(int) Math.min(manifest.length(), 1 << 16)];
+            java.io.FileInputStream in = new java.io.FileInputStream(manifest);
+            int n = in.read(buf);
+            in.close();
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"name\"\\s*:\\s*\"([^\"]+)\"")
+                    .matcher(new String(buf, 0, Math.max(0, n), "UTF-8"));
+            return m.find() ? m.group(1) : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /** Length of the bundled payload, used to tell one archive from another. */
     private long assetLength() {
         try {
@@ -218,51 +298,25 @@ public class NodeServer extends Service {
             }
         }
 
-        // Resume support: an interrupted extraction leaves a checkpoint behind,
-        // but only for the archive that wrote it. Every rebuild changes the byte
-        // stream, so a checkpoint from another payload resumes at an offset that
-        // means nothing here -- and the garbage it decodes lands on unrelated
-        // paths. The checkpoint therefore records the archive length it belongs
-        // to, and a mismatch starts over from an empty tree.
+        /*
+         * Extraction always starts from an empty tree.
+         *
+         * Resuming looked like free time saved on a 600 MB unpack, but a
+         * checkpoint is only meaningful for the exact archive that wrote it, and
+         * an interrupted run leaves a tree this app may not be able to overwrite
+         * -- root-owned leftovers stop the extractor with EACCES on the same file
+         * every time. Parking the tree (a rename, which always succeeds) and
+         * unpacking from scratch takes seconds and cannot inherit that state.
+         */
+        logLine("extracting runtime from an empty tree (~600 MB, one time)");
+        wipeRuntimeTree(rt);
         long assetBytes = assetLength();
-        long resumeAt = 0;
-        int resumeEntries = 0;
-        boolean resuming = false;
-        if (stateFile().isFile()) {
-            String[] parts = readFile(stateFile()).trim().split(":");
-            if (parts.length >= 2) {
-                try {
-                    resumeEntries = Integer.parseInt(parts[0].trim());
-                    resumeAt = Long.parseLong(parts[1].trim());
-                    long recorded = parts.length >= 3 ? Long.parseLong(parts[2].trim()) : -1;
-                    resuming = resumeAt > 0 && recorded == assetBytes;
-                    if (!resuming) {
-                        logLine("ignoring a checkpoint from another payload ("
-                                + recorded + " vs " + assetBytes + " bytes)");
-                    }
-                } catch (NumberFormatException ignored) {
-                    resuming = false;
-                }
-            }
-        }
-        // Whatever is on disk came from an earlier, different payload: its files
-        // may be read-only, and overwriting them is what produced open failures
-        // halfway through. Extraction owns this directory; user state lives in
-        // files/home and is never touched here.
-        if (!resuming && rt.isDirectory()) {
-            deleteRecursive(rt);
-        }
+        stateFile().delete();
 
         if (!rt.mkdirs() && !rt.isDirectory()) {
             throw new IOException("cannot create " + rt);
         }
 
-        if (resuming) {
-            logLine("resuming extraction from entry " + resumeEntries
-                    + " (offset " + resumeAt + ")");
-        } else {
-            logLine("extracting runtime (one time, ~600 MB)...");
-        }
 
         File probeDir = new File(rt.getParentFile() == null ? rt : rt, "probe");
         if (!probeDir.mkdirs() && !probeDir.isDirectory()) {
@@ -292,9 +346,9 @@ public class NodeServer extends Service {
         TarExtractor.Counting counting =
                 new TarExtractor.Counting(new GZIPInputStream(raw, 1 << 16));
         long start = System.currentTimeMillis();
-        final int[] count = {resumeEntries};
-        final long[] lastCheckpoint = {resumeAt};
-        final int[] lastEntries = {resumeEntries};
+        final int[] count = {0};
+        final long[] lastCheckpoint = {0};
+        final int[] lastEntries = {0};
         try {
             TarExtractor.extract(counting, rt, new TarExtractor.Progress() {
                 @Override
@@ -309,13 +363,13 @@ public class NodeServer extends Service {
                 public void onCheckpoint(int entries, long offset) {
                     lastCheckpoint[0] = offset;
                     lastEntries[0] = entries;
-                    try {
-                        writeFile(stateFile(), entries + ":" + offset + ":" + assetBytes);
-                    } catch (IOException e) {
-                        Log.w(TAG, "checkpoint write failed", e);
-                    }
+                    // No checkpoint: the next launch starts from an empty tree
+                    // rather than trusting an offset from a previous attempt.
                 }
-            }, resumeAt);
+            }, 0);
+        } catch (IOException failure) {
+            diagnoseExtractionFailure(failure);
+            throw failure;
         } finally {
             counting.close();
         }
@@ -442,26 +496,57 @@ public class NodeServer extends Service {
             logLine("profile dir unavailable: " + web);
             return;
         }
-        File link = new File(web, "node_modules");
-        File target = new File(runtimeDir(), "dsh/node_modules");
-        boolean linked = false;
+        /*
+         * The profile gets a real node_modules directory, filled with symlinks to
+         * the harness's own packages.
+         *
+         * It used to be a single symlink to runtime/dsh/node_modules, which meant
+         * every plugin installed for the profile landed inside the runtime -- and
+         * the runtime is replaced wholesale whenever the app is updated, taking
+         * those plugins with it. A real directory lives in the harness home
+         * (files/home), which no update touches, so installs survive; the symlinks
+         * to the bundled packages are re-created here on every start, and entries
+         * that are not ours are left exactly as they are.
+         */
+        File modules = new File(web, "node_modules");
+        File bundled = new File(runtimeDir(), "dsh/node_modules");
         try {
-            linked = link.exists() || link.getCanonicalPath().equals(target.getCanonicalPath());
-        } catch (IOException ignored) {
-            // fall through and let ln decide
-        }
-        if (!linked) {
-            try {
-                Process p = new ProcessBuilder("/system/bin/ln", "-sfn",
-                        target.getAbsolutePath(), link.getAbsolutePath())
-                        .redirectErrorStream(true)
-                        .start();
-                int rc = waitForExit(p, 10000);
-                logLine("profile node_modules link rc=" + rc + " -> " + target.getAbsolutePath());
-            } catch (Throwable t) {
-                logLine("profile link failed: " + t);
+            boolean legacyLink = java.nio.file.Files.isSymbolicLink(modules.toPath());
+            if (legacyLink) {
+                logLine("profile node_modules was a symlink; converting it to a real directory");
+                java.nio.file.Files.delete(modules.toPath());
             }
+        } catch (Throwable t) {
+            logLine("profile node_modules check failed: " + t);
         }
+        if (!modules.mkdirs() && !modules.isDirectory()) {
+            logLine("profile node_modules unavailable: " + modules);
+        } else {
+            File[] entries = bundled.listFiles();
+            int linked = 0;
+            if (entries != null) {
+                for (File entry : entries) {
+                    File view = new File(modules, entry.getName());
+                    if (view.exists()) {
+                        continue;
+                    }
+                    try {
+                        Process p = new ProcessBuilder("/system/bin/ln", "-s",
+                                entry.getAbsolutePath(), view.getAbsolutePath())
+                                .redirectErrorStream(true).start();
+                        if (waitForExit(p, 10000) == 0) {
+                            linked++;
+                        }
+                    } catch (Throwable t) {
+                        logLine("profile link failed for " + entry.getName() + ": " + t);
+                    }
+                }
+            }
+            logLine("profile node_modules: " + linked + " bundled packages linked, "
+                    + modules.listFiles().length + " entries total");
+        }
+
+        installSideLoadedPlugins(web);
 
         ensurePluginRows(web);
 
@@ -562,6 +647,93 @@ public class NodeServer extends Service {
             logLine("profile patch: plugin rows written (" + rows.length() + " bytes)");
         } catch (Throwable t) {
             logLine("plugin rows failed: " + t);
+        }
+    }
+
+    /**
+     * Give extraction an empty directory, whatever the old one contains.
+     *
+     * A plain delete is not enough: files from an earlier run may be owned by
+     * root (a payload unpacked through `su`), so the app can neither overwrite
+     * nor remove them -- and the extractor dies on the first such file with
+     * EACCES. Renaming the tree needs write access only to its *parent*, which
+     * the app always owns, so that happens first; removal is then best effort,
+     * with root as the escalation.
+     */
+    private void wipeRuntimeTree(File rt) {
+        File parent = rt.getParentFile();
+        if (parent != null) {
+            File[] old = parent.listFiles();
+            if (old != null) {
+                for (File f : old) {
+                    if (f.getName().startsWith("runtime.stale-")) {
+                        removeTree(f);
+                    }
+                }
+            }
+        }
+        if (!rt.isDirectory()) {
+            return;
+        }
+        if (parent != null) {
+            File stale = new File(parent, "runtime.stale-" + System.currentTimeMillis());
+            if (rt.renameTo(stale)) {
+                logLine("parked the old runtime tree as " + stale.getName());
+                removeTree(stale);
+                return;
+            }
+            logLine("could not park the old runtime tree; falling back to delete");
+        }
+        deleteRecursive(rt);
+        if (rt.isDirectory()) {
+            removeTree(rt);
+        }
+    }
+
+    /** Best-effort removal, escalating to root and reporting what survived. */
+    private void removeTree(File tree) {
+        deleteRecursive(tree);
+        if (!tree.exists()) {
+            return;
+        }
+        logLine("removing " + tree.getName() + " as root");
+        try {
+            Process p = new ProcessBuilder("/system/bin/su", "-c",
+                    "rm -rf " + tree.getAbsolutePath()).redirectErrorStream(true).start();
+            waitForExit(p, 300000);
+        } catch (Throwable t) {
+            logLine("root removal failed: " + t);
+        }
+        if (tree.exists()) {
+            logLine("still present after root removal: " + tree.getAbsolutePath());
+        }
+    }
+
+    /** Report what is in the way when extraction fails. */
+    private void diagnoseExtractionFailure(IOException failure) {
+        logLine("extraction failed: " + failure.getMessage());
+        String path = String.valueOf(failure.getMessage());
+        int mark = path.indexOf("/data/");
+        int end = path.indexOf(".js:", mark);
+        if (mark < 0 || end <= mark) {
+            return;
+        }
+        String probe = path.substring(mark, end + 3);
+        try {
+            Process p = new ProcessBuilder("/system/bin/su", "-c",
+                    "ls -lad " + probe + " " + probe.replace("/index.js", "")
+                            + " 2>&1 | head -4").redirectErrorStream(true).start();
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()));
+            String line;
+            int shown = 0;
+            while ((line = r.readLine()) != null && shown < 4) {
+                logLine("probe: " + line);
+                shown++;
+            }
+            waitForExit(p, 20000);
+        } catch (Throwable t) {
+            logLine("probe failed: " + t);
         }
     }
 
