@@ -112,6 +112,49 @@ patch(
     "P3c 会话发布破陈旧锁",
 )
 
+# ── P13: ptc worker 会清空环境，而这份 node 离开库路径就起不来 ──────────────
+# `dsh-ptc-runtime-node` 为 worker 构造 env 时，把不在 STARTUP_ENVIRONMENT_NAMES
+# 里的变量**一律置空**（map => [key, void 0]）。于是 worker 里的 node 丢掉
+# LD_LIBRARY_PATH → CANNOT LINK EXECUTABLE（libz.so.1）；丢掉 OPENSSL_CONF →
+# 落回编译期写死的 Termux 路径并被拒；丢掉 TMPDIR → os.tmpdir() 退化成不可写的 /tmp。
+# 这个 Set 在语义上就是「予以继承」名单，所以把运行时必需的那几个加进去 ——
+# 它们正是 NodeServer 给主 node 进程设的同一批，不是新依赖。
+#
+# 影响面：只有走 ptc node 运行时的能力（主要是 workflow 工具）。subagent 在主进程内
+# 运行，bash 由 shell 工具保留环境，二者都不受影响。
+patch(
+    "@deepseek-ai/dsh-ptc-runtime-node/lib/index.js",
+    """const STARTUP_ENVIRONMENT_NAMES = new Set([
+	"PATH",
+	"PATHEXT",
+	"SYSTEMROOT",
+	"WINDIR",
+	"TEMP",
+	"TMP"
+]);""",
+    """/*
+ * Android: this node is a bionic build, so it cannot start without its library
+ * path, and its OpenSSL paths are compiled in pointing at the Termux prefix
+ * (see PITFALLS #11). Clearing these in a worker is not a clean environment, it
+ * is a broken one -- and TMPDIR would fall back to an unwritable /tmp.
+ */
+const STARTUP_ENVIRONMENT_NAMES = new Set([
+	"PATH",
+	"PATHEXT",
+	"SYSTEMROOT",
+	"WINDIR",
+	"TEMP",
+	"TMP",
+	"LD_LIBRARY_PATH",
+	"OPENSSL_CONF",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+	"TMPDIR"
+]);""",
+    "this node is a bionic build, so it cannot start",
+    "P13 ptc worker 继承运行时必需的环境变量",
+)
+
 # ── P5: 图片处理不依赖原生 sharp（备用路径）────────────────────────────────
 # 说明：完整的纯 JS 头部解析实现较长，这里只做「不因缺少 sharp 而整体失败」的兜底；
 # 若需要完整的图片能力，请参考 docs/PITFALLS.md 第 5 条自行补全解析器。
