@@ -1056,6 +1056,10 @@ public class NodeServer extends Service {
             // no storage permission yet; the private home stays the workspace
         }
         logLine("workspace: " + workspace.getAbsolutePath());
+        // Both layers in one line: a bug report should identify the app build and
+        // the embedded harness without anyone having to ask.
+        logLine("versions: app " + BuildConfig.APP_VERSION
+                + " · dsh " + BuildConfig.DSH_VERSION);
         writeAgentInstructions(workspace);
         pb.directory(workspace);
         Map<String, String> env = pb.environment();

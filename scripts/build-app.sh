@@ -30,7 +30,7 @@ fi
 KS_ALIAS="${KS_ALIAS:-dshandroid}"
 STAGE="${STAGE_DIR:-$APP/asset-stage}"
 ASSETS="$APP/assets"
-OUT="${OUT:-$HERE/DSH-Android.apk}"
+OUT="${OUT:-$HERE/DSH-Android-v${APP_VERSION:-unknown}-dsh${DSH_VERSION:-unknown}.apk}"
 
 if [ ! -d "$STAGE/runtime" ]; then
   echo "no staged payload at $STAGE/runtime — run stage-app-assets.sh first" >&2
@@ -58,6 +58,8 @@ cat > "$WORK/gen/BuildConfig.java" <<EOF
 package com.dsh.android;
 final class BuildConfig {
     static final String RUNTIME_STAMP = "$STAMP";
+    static final String APP_VERSION = "${APP_VERSION:-unknown}";
+    static final String DSH_VERSION = "${DSH_VERSION:-unknown}";
     private BuildConfig() {}
 }
 EOF
@@ -73,11 +75,16 @@ else
   RES_ARGS=()
 fi
 
-# The manifest's versionCode is the single source of truth: the human-readable
-# versionName is derived from it so it can never go stale between builds.
-CODE="$(grep -o 'android:versionCode="[0-9]*"' "$APP/AndroidManifest.xml" | grep -o '[0-9]*')"
-NAME="0.$CODE"
-echo "   version: $NAME ($CODE)"
+# Version numbers come from ./VERSION -- one place, used by the manifest, the
+# APK name and the docs. versionName carries the embedded DSH version so a bug
+# report can identify both layers at a glance.
+if [ -f "$HERE/VERSION" ]; then
+    # shellcheck disable=SC1091
+    . "$HERE/VERSION"
+fi
+CODE="${APP_VERSION_CODE:-$(grep -o 'android:versionCode="[0-9]*"' "$APP/AndroidManifest.xml" | grep -o '[0-9]*')}"
+NAME="${APP_VERSION:?VERSION must define APP_VERSION}+dsh.${DSH_VERSION:?VERSION must define DSH_VERSION}"
+echo "   version: $NAME (code $CODE)  [app $APP_VERSION / dsh $DSH_VERSION]"
 # aapt2's --version-name does not override a value already in the manifest, so
 # rewrite the manifest itself: versionCode stays the single source of truth.
 cp "$APP/AndroidManifest.xml" "$WORK/AndroidManifest.xml"

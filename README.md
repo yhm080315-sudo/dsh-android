@@ -47,8 +47,19 @@ bash scripts/build-app.sh
 
 ### 发布的 APK 与版本号
 
-Git tag（`v1.0.1`）是**发布批次**；APK 自身的版本号是 `versionCode 55` / `versionName 0.55`，
-以 `app/AndroidManifest.xml` 为准，`versionName` 由构建脚本从 `versionCode` 推导。
+版本号只有一处定义：仓库根目录的 **`VERSION`** 文件。构建脚本、APK 文件名、
+`AndroidManifest.xml` 和文档都从它读，不在两处各写一遍。
+
+```
+APP_VERSION=1.0.1            本项目版本（对应 Git tag v1.0.1）
+APP_VERSION_CODE=10001       Android versionCode（= 1*10000 + 0*100 + 1）
+DSH_VERSION=0.2.0-rc.2       内嵌的 DeepSeek Harness 版本
+```
+
+APK 的 `versionName` 把两层都带上：**`1.0.1+dsh.0.2.0-rc.2`**，
+产物名为 `DSH-Android-v1.0.1-dsh0.2.0-rc.2.apk`。
+应用启动日志里也会打一行 `versions: app … · dsh …`——
+报 bug 时看这行就知道是哪一层的版本。
 
 **已发布 APK 的签名证书 SHA-256（用于校验下载物真伪）：**
 

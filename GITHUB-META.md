@@ -23,7 +23,7 @@ android  deepseek  dsh  ai-agent  nodejs  bionic  termux  webview  android-app  
 
 ## 首次发布说明（Release Notes）
 
-**标题**：`v1.0.0 — DSH for Android：自带运行时的独立 APK`
+**标题**：`v1.0.1 — DSH for Android 1.0.1（内嵌 DSH 0.2.0-rc.2）`
 
 ```markdown
 把 DeepSeek Harness 完整移植到 Android，做成一个**自带运行时**的独立应用。
@@ -70,6 +70,23 @@ android  deepseek  dsh  ai-agent  nodejs  bionic  termux  webview  android-app  
 ```
 
 ---
+
+## 版本号约定
+
+单一真相来源是仓库根目录的 **`VERSION`**：
+
+```
+APP_VERSION=1.0.1            本项目版本，与 Git tag 一致
+APP_VERSION_CODE=10001       主*10000 + 次*100 + 修订
+DSH_VERSION=0.2.0-rc.2       内嵌的 DeepSeek Harness 版本
+```
+
+- APK `versionName` = **`1.0.1+dsh.0.2.0-rc.2`**（SemVer 的 build metadata 位置放 DSH 版本）
+- 产物名 = `DSH-Android-v1.0.1-dsh0.2.0-rc.2.apk`
+- Release tag = `v1.0.1`
+- 应用启动日志里有一行 `versions: app 1.0.1 · dsh 0.2.0-rc.2`
+
+发新版时**只改 `VERSION` 一个文件**，其余（manifest、APK 名、日志）都会跟着走。
 
 ## 建议的仓库设置
 
