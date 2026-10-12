@@ -1,0 +1,592 @@
+package com.dsh.android;
+
+import android.util.Log;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URLDecoder;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Loopback HTTP bridge that lets the bundled runtime (and therefore the agent
+ * running inside the app) capture the screen and inject input events.
+ *
+ * Why it lives in the app: capturing the framebuffer and injecting events need
+ * CAPTURE_VIDEO_OUTPUT / INJECT_EVENTS, which are signature-level permissions an
+ * ordinary app can never hold. This device is rooted and the user has already
+ * granted the app root, so the bridge shells out through /system/bin/su -- the
+ * same channel MainActivity.probeRoot() uses.
+ *
+ * Security posture: bound to 127.0.0.1 only, every argument is strictly
+ * validated so no shell metacharacter reaches the command line, and there is
+ * deliberately no "run arbitrary command" endpoint.
+ */
+final class DeviceServer {
+
+    private static final String TAG = "DSH";
+    private static final int[] PORTS = {3090, 3091, 3092, 3093, 3094, 3095, 3096};
+    private static final int MAX_BODY = 8 * 1024 * 1024;
+
+    private static volatile DeviceServer instance;
+
+    private final File filesDir;
+    private volatile int port = -1;
+    private volatile boolean rootOk = false;
+
+    private DeviceServer(File filesDir) {
+        this.filesDir = filesDir;
+    }
+
+    /** Idempotent: a WebView reload recreates the activity but must not rebind. */
+    static synchronized void startOnce(File filesDir) {
+        if (instance != null) {
+            return;
+        }
+        DeviceServer server = new DeviceServer(filesDir);
+        instance = server;
+        server.start();
+    }
+
+    static int currentPort() {
+        DeviceServer server = instance;
+        return server == null ? -1 : server.port;
+    }
+
+    static boolean rootAvailable() {
+        DeviceServer server = instance;
+        return server != null && server.rootOk;
+    }
+
+    private void start() {
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                for (int candidate : PORTS) {
+                    ServerSocket server = null;
+                    try {
+                        server = new ServerSocket(candidate, 8, InetAddress.getByName("127.0.0.1"));
+                        port = candidate;
+                        rootOk = probeRoot();
+                        Log.i(TAG, "device bridge on http://127.0.0.1:" + candidate + "/ root=" + rootOk);
+                        DiagnosticServer.appendLog(filesDir,
+                                "device bridge: http://127.0.0.1:" + candidate + "/ root=" + rootOk);
+                        serve(server);
+                        return;
+                    } catch (Throwable inUse) {
+                        if (server != null) {
+                            try {
+                                server.close();
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                }
+                Log.w(TAG, "device bridge could not bind any port");
+                DiagnosticServer.appendLog(filesDir, "device bridge: could not bind any port");
+            }
+        }, "dsh-device");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private boolean probeRoot() {
+        Shell shell = run(new String[]{"/system/bin/su", "-c", "id"}, 30000);
+        return shell.code == 0 && shell.text().contains("uid=0");
+    }
+
+    private void serve(ServerSocket server) {
+        while (!server.isClosed()) {
+            Socket socket = null;
+            try {
+                socket = server.accept();
+                socket.setSoTimeout(120000);
+                handle(socket);
+            } catch (Throwable e) {
+                if (server.isClosed()) {
+                    return;
+                }
+            } finally {
+                if (socket != null) {
+                    try {
+                        socket.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ request
+
+    private static final class Request {
+        String method = "GET";
+        String path = "/";
+        final Map<String, String> query = new HashMap<String, String>();
+    }
+
+    private void handle(Socket socket) throws Exception {
+        InputStream in = socket.getInputStream();
+        String rawHead = readHead(in);
+        if (rawHead == null || rawHead.isEmpty()) {
+            return;
+        }
+        String[] lines = rawHead.split("\r\n");
+        String[] first = lines[0].split(" ");
+        Request req = new Request();
+        if (first.length >= 2) {
+            req.method = first[0];
+            String target = first[1];
+            int q = target.indexOf('?');
+            if (q >= 0) {
+                req.path = target.substring(0, q);
+                parseQuery(target.substring(q + 1), req.query);
+            } else {
+                req.path = target;
+            }
+        }
+        int contentLength = 0;
+        for (String line : lines) {
+            int c = line.indexOf(':');
+            if (c > 0 && line.substring(0, c).trim().equalsIgnoreCase("Content-Length")) {
+                try {
+                    contentLength = Integer.parseInt(line.substring(c + 1).trim());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+        for (int i = 0; i < contentLength; i++) {
+            if (in.read() < 0) {
+                break;
+            }
+        }
+        dispatch(socket, req);
+    }
+
+    /** Read up to the end of headers; null when the peer sent nothing. */
+    private static String readHead(InputStream in) throws Exception {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        int match = 0;
+        int b;
+        while ((b = in.read()) >= 0) {
+            buf.write(b);
+            if ((match == 0 || match == 2) && b == '\r') {
+                match++;
+            } else if ((match == 1 || match == 3) && b == '\n') {
+                match++;
+                if (match == 4) {
+                    break;
+                }
+            } else {
+                match = 0;
+            }
+            if (buf.size() > 64 * 1024) {
+                break;
+            }
+        }
+        return buf.size() == 0 ? null : new String(buf.toByteArray(), "UTF-8");
+    }
+
+    private static void parseQuery(String q, Map<String, String> into) {
+        for (String pair : q.split("&")) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int eq = pair.indexOf('=');
+            try {
+                String k = eq < 0 ? pair : pair.substring(0, eq);
+                String v = eq < 0 ? "" : pair.substring(eq + 1);
+                into.put(URLDecoder.decode(k, "UTF-8"), URLDecoder.decode(v, "UTF-8"));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- dispatch
+
+    private void dispatch(Socket socket, Request req) throws Exception {
+        String path = req.path;
+        try {
+            if (path.equals("/") || path.equals("/device/status")) {
+                status(socket);
+            } else if (path.equals("/device/shot")) {
+                shot(socket, req.query);
+            } else if (path.equals("/device/tap")) {
+                simple(socket, su("input", "tap", num(req, "x"), num(req, "y")));
+            } else if (path.equals("/device/swipe")) {
+                simple(socket, su("input", "swipe", num(req, "x1"), num(req, "y1"),
+                        num(req, "x2"), num(req, "y2"), duration(req)));
+            } else if (path.equals("/device/key")) {
+                simple(socket, su("input", "keyevent", keyArg(req)));
+            } else if (path.equals("/device/text")) {
+                simple(socket, su("input", "text", textArg(req)));
+            } else if (path.equals("/device/start")) {
+                simple(socket, su("am", "start", "-n", componentArg(req)));
+            } else if (path.equals("/device/ocr")) {
+                ocr(socket, req.query);
+            } else if (path.equals("/device/top")) {
+                simple(socket, su("sh", "-c",
+                        "dumpsys activity activities | grep -m1 topResumedActivity"));
+            } else {
+                send(socket, 404, "text/plain; charset=utf-8",
+                        "unknown endpoint\n".getBytes("UTF-8"));
+            }
+        } catch (BadRequest bad) {
+            send(socket, 400, "text/plain; charset=utf-8",
+                    ("bad request: " + bad.getMessage() + "\n").getBytes("UTF-8"));
+        } catch (Throwable t) {
+            Log.w(TAG, "device bridge error on " + path, t);
+            send(socket, 500, "text/plain; charset=utf-8",
+                    ("error: " + t + "\n").getBytes("UTF-8"));
+        }
+    }
+
+    private void status(Socket socket) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        sb.append("dsh device bridge\n");
+        sb.append("port: ").append(port).append('\n');
+        sb.append("root: ").append(rootOk).append('\n');
+        sb.append("endpoints:\n");
+        sb.append("  GET /device/shot[?out=NAME]                PNG bytes of the current screen\n");
+        sb.append("  GET /device/tap?x=&y=                      inject a tap\n");
+        sb.append("  GET /device/swipe?x1=&y1=&x2=&y2=[&ms=]    inject a swipe\n");
+        sb.append("  GET /device/key?name=home|back|enter|volup|voldown|power|CODE\n");
+        sb.append("  GET /device/text?value=...                 type text\n");
+        sb.append("  GET /device/start?component=pkg/.Act       launch an activity\n");
+        sb.append("  GET /device/top                            current foreground activity\n");
+        sb.append("  GET /device/ocr[?lang=chi_sim+eng]         OCR the screen (needs OCR runtime)\n");
+        sb.append("  GET /device/status                         this text\n");
+        send(socket, 200, "text/plain; charset=utf-8", sb.toString().getBytes("UTF-8"));
+    }
+
+    /** Capture the screen and return raw PNG bytes so callers need no decoder. */
+    private void shot(Socket socket, Map<String, String> query) throws Exception {
+        File out = new File(filesDir, "screen.png");
+        String named = query.get("out");
+        if (named != null && named.matches("[A-Za-z0-9_.-]{1,64}")) {
+            out = new File(filesDir, named);
+        }
+        // Writing into the app's private dir avoids scoped-storage problems. No -d
+        // is passed: the display id is not stable across reconnects on this device.
+        Shell shell = run(new String[]{"/system/bin/su", "-c",
+                "screencap -p " + shellQuote(out.getAbsolutePath())}, 45000);
+        if (!out.isFile() || out.length() == 0) {
+            send(socket, 500, "text/plain; charset=utf-8",
+                    ("capture failed: " + shell.text() + "\n").getBytes("UTF-8"));
+            return;
+        }
+        send(socket, 200, "image/png", readFile(out, MAX_BODY));
+    }
+
+    /**
+     * OCR via the tesseract that ships inside the companion runtime, when that
+     * runtime is present. Shells out through proot because tesseract is a glibc
+     * binary while the app process is bionic.
+     */
+    private void ocr(Socket socket, Map<String, String> query) throws Exception {
+        String lang = query.get("lang");
+        if (lang == null || !lang.matches("[a-z_+]{1,64}")) {
+            lang = "chi_sim+eng";
+        }
+        File shot = new File(filesDir, "screen.png");
+        run(new String[]{"/system/bin/su", "-c",
+                "screencap -p " + shellQuote(shot.getAbsolutePath())}, 45000);
+        if (!shot.isFile() || shot.length() == 0) {
+            send(socket, 500, "text/plain; charset=utf-8", "capture failed\n".getBytes("UTF-8"));
+            return;
+        }
+        File scriptFile = new File(filesDir, "ocr.sh");
+        writeFile(scriptFile, ocrScript(shot, lang));
+        Shell shell = run(new String[]{"/system/bin/su", "-c",
+                "sh " + shellQuote(scriptFile.getAbsolutePath())}, 120000);
+        String text = shell.text();
+        if (text.startsWith("OCR_RUNTIME_MISSING")) {
+            send(socket, 501, "text/plain; charset=utf-8", text.getBytes("UTF-8"));
+            return;
+        }
+        send(socket, 200, "text/plain; charset=utf-8", text.getBytes("UTF-8"));
+    }
+
+    /**
+     * The OCR runtime is the proot Ubuntu rootfs owned by the companion client
+     * app. Those paths are not part of this app's contract, so probe for them and
+     * report honestly instead of failing obscurely.
+     */
+    private static String ocrScript(File shot, String lang) {
+        String shim = "/data/local/tmp/prootshim";
+        String rootfs = "/data/user/0/com.dsh.client/files/linux/ubuntu";
+        File parent = shot.getParentFile();
+        String dir = parent == null ? "/data/local/tmp" : parent.getAbsolutePath();
+        return "#!/system/bin/sh\n"
+                + "U=" + shellQuote(rootfs) + "\n"
+                + "S=" + shellQuote(shim) + "\n"
+                + "[ -d \"$U\" ] || { echo \"OCR_RUNTIME_MISSING: no ubuntu rootfs at $U\"; exit 0; }\n"
+                + "[ -x \"$S/libproroot.so\" ] || { echo \"OCR_RUNTIME_MISSING: no proroot shim at $S\"; exit 0; }\n"
+                + "export LD_LIBRARY_PATH=$S\n"
+                + "exec $S/libproroot.so --static-loader -0 -r $U -w /root \\\n"
+                + "  -b /dev:/dev -b /proc:/proc -b /sys:/sys -b " + shellQuote(dir) + ":/hostshot \\\n"
+                + "  /bin/bash -lc " + shellQuote("tesseract /hostshot/" + shot.getName()
+                        + " stdout -l " + lang + " 2>/dev/null") + "\n";
+    }
+
+    // ------------------------------------------------------------------- shell
+
+    private static final class Shell {
+        int code;
+        byte[] out = new byte[0];
+        byte[] err = new byte[0];
+
+        String text() {
+            String o = new String(out, 0, out.length);
+            String e = new String(err, 0, err.length);
+            if (o.length() == 0) {
+                return e;
+            }
+            return e.length() == 0 ? o : o + "\n" + e;
+        }
+    }
+
+    /**
+     * Run argv with a hard deadline. The array goes straight to exec, so nothing
+     * reaches a shell unless the caller explicitly asked for one.
+     */
+    private static Shell run(String[] argv, long timeoutMs) {
+        Shell result = new Shell();
+        Process p = null;
+        try {
+            p = new ProcessBuilder(argv).start();
+            final Process proc = p;
+            final ByteArrayOutputStream out = new ByteArrayOutputStream();
+            final ByteArrayOutputStream err = new ByteArrayOutputStream();
+            Thread to = pump(proc.getInputStream(), out);
+            Thread te = pump(proc.getErrorStream(), err);
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    result.code = proc.exitValue();
+                    break;
+                } catch (IllegalThreadStateException alive) {
+                    Thread.sleep(40);
+                }
+            }
+            if (p.isAlive()) {
+                p.destroy();
+                result.code = -1;
+            } else {
+                result.code = p.exitValue();
+            }
+            to.join(2000);
+            te.join(2000);
+            result.out = out.toByteArray();
+            result.err = err.toByteArray();
+        } catch (Throwable t) {
+            result.code = -2;
+            result.err = ("spawn failed: " + t).getBytes();
+        } finally {
+            if (p != null) {
+                p.destroy();
+            }
+        }
+        return result;
+    }
+
+    private static Thread pump(final InputStream in, final ByteArrayOutputStream into) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                byte[] buf = new byte[8192];
+                try {
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        into.write(buf, 0, n);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }, "dsh-pump");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    /** Join already-validated arguments into one `su -c` command line. */
+    private static Shell su(String... args) {
+        StringBuilder sb = new StringBuilder();
+        for (String a : args) {
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(a);
+        }
+        return run(new String[]{"/system/bin/su", "-c", sb.toString()}, 60000);
+    }
+
+    private void simple(Socket socket, Shell shell) throws Exception {
+        String body = "code=" + shell.code + "\n" + shell.text();
+        send(socket, shell.code == 0 ? 200 : 500, "text/plain; charset=utf-8",
+                body.getBytes("UTF-8"));
+    }
+
+    // -------------------------------------------------------------- validation
+
+    private static final class BadRequest extends Exception {
+        BadRequest(String message) {
+            super(message);
+        }
+    }
+
+    private static String num(Request req, String key) throws BadRequest {
+        String v = req.query.get(key);
+        if (v == null || !v.matches("-?[0-9]{1,6}")) {
+            throw new BadRequest("missing or invalid '" + key + "'");
+        }
+        return v;
+    }
+
+    private static String duration(Request req) throws BadRequest {
+        String v = req.query.get("ms");
+        if (v == null) {
+            return "300";
+        }
+        if (!v.matches("[0-9]{1,6}")) {
+            throw new BadRequest("invalid 'ms'");
+        }
+        return v;
+    }
+
+    /** Named keys keep the common cases readable; numeric codes stay allowed. */
+    private static String keyArg(Request req) throws BadRequest {
+        String v = req.query.get("name");
+        if (v == null) {
+            v = req.query.get("code");
+        }
+        if (v == null) {
+            throw new BadRequest("missing 'name' or 'code'");
+        }
+        if (v.matches("[0-9]{1,4}")) {
+            return v;
+        }
+        String lower = v.toLowerCase();
+        if (lower.equals("home")) {
+            return "KEYCODE_HOME";
+        }
+        if (lower.equals("back")) {
+            return "KEYCODE_BACK";
+        }
+        if (lower.equals("enter")) {
+            return "KEYCODE_ENTER";
+        }
+        if (lower.equals("volup")) {
+            return "KEYCODE_VOLUME_UP";
+        }
+        if (lower.equals("voldown")) {
+            return "KEYCODE_VOLUME_DOWN";
+        }
+        if (lower.equals("power")) {
+            return "KEYCODE_POWER";
+        }
+        if (lower.equals("menu")) {
+            return "KEYCODE_MENU";
+        }
+        if (lower.equals("appswitch")) {
+            return "KEYCODE_APP_SWITCH";
+        }
+        if (v.matches("KEYCODE_[A-Z0-9_]{1,40}")) {
+            return v;
+        }
+        throw new BadRequest("unknown key name");
+    }
+
+    /**
+     * `input text` splits on spaces, so spaces become %s. Everything else is
+     * validated away rather than escaped, which keeps a crafted request from
+     * reaching the shell at all.
+     */
+    private static String textArg(Request req) throws BadRequest {
+        String v = req.query.get("value");
+        if (v == null) {
+            throw new BadRequest("missing 'value'");
+        }
+        if (v.length() > 2000) {
+            throw new BadRequest("'value' too long");
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c == ' ') {
+                sb.append("%s");
+            } else if (c == '%') {
+                sb.append("%%");
+            } else if (c > 0x20 && c < 0x7f && "\\'\"`$&|;<>(){}[]*?~!#\n".indexOf(c) < 0) {
+                sb.append(c);
+            }
+            // Anything else is dropped: non-ASCII needs an IME, not `input`.
+        }
+        if (sb.length() == 0) {
+            throw new BadRequest("no typeable ASCII in 'value'");
+        }
+        return sb.toString();
+    }
+
+    private static String componentArg(Request req) throws BadRequest {
+        String v = req.query.get("component");
+        if (v == null || !v.matches("[A-Za-z0-9_.]{1,120}/[A-Za-z0-9_.$]{1,120}")) {
+            throw new BadRequest("'component' must look like pkg/.Activity");
+        }
+        return v;
+    }
+
+    private static String shellQuote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
+    }
+
+    // -------------------------------------------------------------------- http
+
+    private static void send(Socket socket, int code, String type, byte[] body) throws Exception {
+        String reason = code == 200 ? "OK" : code == 400 ? "Bad Request"
+                : code == 404 ? "Not Found" : code == 501 ? "Not Implemented"
+                : "Internal Server Error";
+        OutputStream out = socket.getOutputStream();
+        StringBuilder head = new StringBuilder();
+        head.append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n");
+        head.append("Content-Type: ").append(type).append("\r\n");
+        head.append("Content-Length: ").append(body.length).append("\r\n");
+        head.append("Cache-Control: no-store\r\n");
+        head.append("Connection: close\r\n\r\n");
+        out.write(head.toString().getBytes("UTF-8"));
+        out.write(body);
+        out.flush();
+    }
+
+    private static byte[] readFile(File f, int cap) throws Exception {
+        InputStream in = new java.io.FileInputStream(f);
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                if (out.size() > cap) {
+                    break;
+                }
+            }
+            return out.toByteArray();
+        } finally {
+            in.close();
+        }
+    }
+
+    private static void writeFile(File f, String content) throws Exception {
+        java.io.FileOutputStream out = new java.io.FileOutputStream(f);
+        try {
+            out.write(content.getBytes("UTF-8"));
+        } finally {
+            out.close();
+        }
+    }
+}

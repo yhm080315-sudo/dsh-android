@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dsh.android"
+    android:versionCode="27"
+    android:versionName="0.24">
+
+    <!-- targetSdk 28 keeps the pre-Android-10 exec-from-app-data policy that the
+         bundled runtime depends on: the harness runs ELF binaries out of the
+         app's private directory, exactly like Termux does from its prefix. -->
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ requires a declared type plus its matching permission for
+         foreground services; the node process is kept alive as a data-sync job. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Shared-storage access so the harness can read and write the phone's files.
+         READ/WRITE_EXTERNAL_STORAGE are the runtime permissions (granted in-app);
+         MANAGE_EXTERNAL_STORAGE is the "All files access" special permission the
+         user toggles in Settings on Android 11+. requestLegacyExternalStorage
+         keeps the pre-scoped model working where the platform still honours it. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="DeepSeek Harness"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
+        android:preserveLegacyExternalStorage="true"
+        android:hardwareAccelerated="true"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:label="DeepSeek Harness">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <provider
+            android:name=".UpdateProvider"
+            android:authorities="com.dsh.android.updates"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+        <service
+            android:name=".NodeServer"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>

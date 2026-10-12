@@ -1,0 +1,31 @@
+# 构建产物
+*.apk
+*.idsig
+assets/
+asset-stage/
+asset-stage.stale-*/
+runtime/
+runtime.stale-*/
+probe-assets/*.bin
+
+# 依赖与中间产物
+node_modules/
+bionic-dsh/
+dsh-install/
+glibc*/
+musl-run/
+trimtest/
+*.class
+classes/
+dex/
+*.tar.gz
+
+# 签名密钥：绝不能提交
+*.jks
+*.keystore
+keystore.jks
+
+# 机密与本地状态
+.credentials.yaml
+*.local.*
+.local/

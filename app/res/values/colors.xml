@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The web client's dark boot background, so the launcher plate matches. -->
+    <color name="ic_launcher_background">#FF151517</color>
+</resources>
