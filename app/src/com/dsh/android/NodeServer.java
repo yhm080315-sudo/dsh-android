@@ -361,6 +361,26 @@ public class NodeServer extends Service {
          * run here; Android's own app sandbox is the boundary that remains.
          */
         env.put("DSH_PERMISSION_MODE", "danger-full-access");
+        /*
+         * The device bridge is token-authenticated (loopback is not isolation on
+         * Android), so the agent needs the token to call it. Export it and drop a
+         * copy in the harness home -- anything the agent runs can read it there.
+         */
+        String deviceToken = DeviceServer.token();
+        if (deviceToken != null && !deviceToken.isEmpty()) {
+            env.put("DSH_DEVICE_TOKEN", deviceToken);
+            try {
+                File tokenFile = new File(new File(home, ".dsh"), ".device-token");
+                java.io.FileOutputStream out = new java.io.FileOutputStream(tokenFile);
+                out.write(deviceToken.getBytes("UTF-8"));
+                out.close();
+                Process p = new ProcessBuilder("/system/bin/chmod", "600",
+                        tokenFile.getAbsolutePath()).redirectErrorStream(true).start();
+                p.waitFor();
+            } catch (Throwable t) {
+                // The token is still in the environment; the file is a convenience.
+            }
+        }
         env.put("LD_LIBRARY_PATH", new File(prefix, "lib").getAbsolutePath());
         env.put("LANG", "C.UTF-8");
         env.put("TERM", "xterm-256color");
@@ -763,7 +783,18 @@ public class NodeServer extends Service {
                 + "\n"
                 + "## Notes\n"
                 + "\n"
-                + "- The user is on a phone screen: keep output short, prefer files over long replies.\n";
+                + "- The user is on a phone screen: keep output short, prefer files over long replies.\n"
+                + "\n"
+                + "## Device bridge\n"
+                + "\n"
+                + "- A local HTTP bridge exposes the phone itself: `/device/shot` (screenshot),\n"
+                + "  `/device/tap?x=&y=`, `/device/swipe`, `/device/key?name=`, `/device/text?value=`,\n"
+                + "  `/device/start?component=`, `/device/top`, `/device/ocr`, `/device/status`.\n"
+                + "- It is bound to 127.0.0.1 **and requires a token** (loopback is not isolation on\n"
+                + "  Android -- any app can reach it). Pass it as `?token=` or an `X-Device-Token`\n"
+                + "  header. The token is in the environment as `DSH_DEVICE_TOKEN` and in\n"
+                + "  `$DSH_HOME/.device-token`.\n"
+                + "- Most endpoints act through `su`, so they need root to have been granted.\n";
         try {
             if (target.isFile()) {
                 byte[] existing = new byte[(int) target.length()];

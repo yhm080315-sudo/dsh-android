@@ -26,11 +26,16 @@ musl 的情况更隐蔽：`--version` 之类不进入 V8 的路径能跑，**一
 
 **验证方法**
 
-不要靠猜。`probe-assets/tsys.bin` 是一个逐项探测系统调用的工具：
+不要靠猜。仓库里的 `tools/check-runtime.sh` 会对任意二进制做判定，
+并逐项探测相关系统调用（`rseq`、`clone3`、`madvise`、`membarrier` …）：
 
 ```bash
-tsys.bin all      # 输出每个 syscall 的 rc / errno
+bash tools/check-runtime.sh path/to/node
+#   exit 159 → 这个运行时的 libc 会注册 rseq，被 seccomp 杀掉
+#   exit 0   → 能在这个沙箱里跑
 ```
+
+（原先用的是一次性的探测二进制，没有随仓库发布；现在换成了可读、可改、可复现的脚本。）
 
 **结论**
 

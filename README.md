@@ -45,6 +45,24 @@ bash scripts/build-app.sh
 
 产物：`DSH-Android.apk`，用 `keystore.jks` 签名（脚本首次运行会生成，**请妥善保管，丢了就无法覆盖升级**）。
 
+### 发布的 APK 与版本号
+
+Git tag（`v1.0.0`）是**发布批次**；APK 自身的版本号是 `versionCode 54` / `versionName 0.54`，
+以 `app/AndroidManifest.xml` 为准，`versionName` 由构建脚本从 `versionCode` 推导。
+
+**已发布 APK 的签名证书 SHA-256（用于校验下载物真伪）：**
+
+```
+76:F0:49:3B:E7:75:8E:94:4F:30:A0:6D:65:95:DE:70:B7:24:FF:B0:D1:C4:B4:8F:90:FD:CF:B5:11:D5:4B:B9
+```
+
+```bash
+apksigner verify --print-certs DSH-Android-v54.apk | grep "SHA-256 digest"
+```
+
+⚠️ **装过官方 APK 的人无法用自己构建的 APK 覆盖升级**——签名不同，Android 会拒绝安装，
+必须先卸载（会清空应用数据）。想自己构建长期使用，请从第一次就用你自己的 keystore。
+
 ### 给内嵌负载打补丁
 
 DSH 是为 Linux/macOS 写的，在 Android 上有若干必须处理的地方（硬链接、seccomp、原生模块……）。

@@ -98,8 +98,13 @@ android  deepseek  dsh  ai-agent  nodejs  bionic  termux  webview  android-app  
 - DeepSeek Harness (`@deepseek-ai/dsh`) —— MIT，https://www.npmjs.com/package/@deepseek-ai/dsh
 - Node.js（Termux bionic 构建）—— MIT，https://github.com/termux/termux-packages
 - ripgrep —— MIT / Unlicense，https://github.com/BurntSushi/ripgrep
-- GNU coreutils —— **GPL-3.0**，源码：https://www.gnu.org/software/coreutils/
-- bash —— **GPL-3.0**，源码：https://www.gnu.org/software/bash/
+- GNU coreutils —— **GPL-3.0**，对应源码（Termux 构建版本）：
+  https://github.com/termux/termux-packages/tree/master/packages/coreutils
+- bash —— **GPL-3.0**，对应源码（Termux 构建版本）：
+  https://github.com/termux/termux-packages/tree/master/packages/bash
+
+> 这些二进制来自 Termux 的构建，带发行方补丁，属于修改版本；
+> 因此「对应源码」指向 Termux 的构建源码，而不是上游原始版本。
 
 构建脚本见仓库 `scripts/`，全部二进制均为构建时下载，未提交进版本库。
 ```

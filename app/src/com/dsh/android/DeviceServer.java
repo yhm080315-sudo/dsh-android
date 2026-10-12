@@ -23,7 +23,7 @@ import java.util.Map;
  * granted the app root, so the bridge shells out through /system/bin/su -- the
  * same channel MainActivity.probeRoot() uses.
  *
- * Security posture: bound to 127.0.0.1 only, every argument is strictly
+ * Security posture: bound to 127.0.0.1, token-authenticated, and every argument is strictly
  * validated so no shell metacharacter reaches the command line, and there is
  * deliberately no "run arbitrary command" endpoint.
  */
@@ -38,9 +38,11 @@ final class DeviceServer {
     private final File filesDir;
     private volatile int port = -1;
     private volatile boolean rootOk = false;
+    private final String token;
 
     private DeviceServer(File filesDir) {
         this.filesDir = filesDir;
+        this.token = loadOrCreateToken(filesDir);
     }
 
     /** Idempotent: a WebView reload recreates the activity but must not rebind. */
@@ -128,6 +130,11 @@ final class DeviceServer {
         String method = "GET";
         String path = "/";
         final Map<String, String> query = new HashMap<String, String>();
+        final Map<String, String> headers = new HashMap<String, String>();
+
+        String header(String name) {
+            return headers.get(name.toLowerCase(java.util.Locale.US));
+        }
     }
 
     private void handle(Socket socket) throws Exception {
@@ -151,6 +158,14 @@ final class DeviceServer {
             }
         }
         int contentLength = 0;
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            int c = line.indexOf(':');
+            if (c > 0) {
+                req.headers.put(line.substring(0, c).trim().toLowerCase(java.util.Locale.US),
+                        line.substring(c + 1).trim());
+            }
+        }
         for (String line : lines) {
             int c = line.indexOf(':');
             if (c > 0 && line.substring(0, c).trim().equalsIgnoreCase("Content-Length")) {
@@ -165,7 +180,115 @@ final class DeviceServer {
                 break;
             }
         }
+        if (!authorized(req, socket)) {
+            return;
+        }
         dispatch(socket, req);
+    }
+
+    /**
+     * Authenticate the caller before any endpoint runs.
+     *
+     * Binding to 127.0.0.1 is not isolation on Android: every app on the device
+     * shares the loopback interface, so `curl http://127.0.0.1:<port>/device/tap`
+     * worked from anywhere. Worse, a plain web page can drive the endpoints with
+     * `<img src="http://127.0.0.1:.../device/tap?x=..&y=..">` -- no CORS, no
+     * prompt -- and every one of them runs through the authorised `su` channel.
+     *
+     * Three checks, cheapest first:
+     *   1. fail closed when no token exists (never serve unauthenticated);
+     *   2. refuse anything a browser sent (Origin / cross-site Sec-Fetch-Site) --
+     *      no legitimate client here is a browser;
+     *   3. require the per-install token, compared without early exit.
+     */
+    private boolean authorized(Request req, Socket socket) throws Exception {
+        String token = this.token;
+        String deny = null;
+        if (token == null || token.isEmpty()) {
+            deny = "device bridge is not configured (no token)";
+        } else if (req.header("origin") != null) {
+            deny = "browser-originated requests are not accepted";
+        } else {
+            String site = req.header("sec-fetch-site");
+            if (site != null && !site.equalsIgnoreCase("same-origin") && !site.equalsIgnoreCase("none")) {
+                deny = "cross-site requests are not accepted";
+            }
+        }
+        String presented = req.query.get("token");
+        if (deny == null && presented == null) {
+            presented = req.header("x-device-token");
+        }
+        if (deny == null && !constantTimeEquals(token, presented)) {
+            deny = "bad or missing token";
+        }
+        if (deny != null) {
+            send(socket, 401, "text/plain; charset=utf-8",
+                    ("unauthorized: " + deny + "\n").getBytes("UTF-8"));
+            return false;
+        }
+        return true;
+    }
+
+    /** Compare without leaking length or position through timing. */
+    private static boolean constantTimeEquals(String expected, String actual) {
+        if (actual == null) {
+            return false;
+        }
+        byte[] a = expected.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] b = actual.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int diff = a.length ^ b.length;
+        for (int i = 0; i < a.length && i < b.length; i++) {
+            diff |= a[i] ^ b[i];
+        }
+        return diff == 0;
+    }
+
+    /** The per-install token, for the in-app agent to read back. */
+    static String token() {
+        DeviceServer server = instance;
+        return server == null ? null : server.token;
+    }
+
+    /**
+     * Load the bridge token, creating it on first run with 0600.
+     *
+     * Returning null means "do not serve": a bridge that cannot authenticate must
+     * stay closed rather than fall back to being open.
+     */
+    private static String loadOrCreateToken(File filesDir) {
+        File file = new File(filesDir, ".device-token");
+        try {
+            if (file.isFile()) {
+                byte[] buf = new byte[256];
+                java.io.FileInputStream in = new java.io.FileInputStream(file);
+                int n = in.read(buf);
+                in.close();
+                String existing = new String(buf, 0, Math.max(0, n), "UTF-8").trim();
+                if (!existing.isEmpty()) {
+                    return existing;
+                }
+            }
+            byte[] random = new byte[24];
+            new java.security.SecureRandom().nextBytes(random);
+            StringBuilder hex = new StringBuilder();
+            for (byte value : random) {
+                hex.append(String.format("%02x", value));
+            }
+            String token = hex.toString();
+            java.io.FileOutputStream out = new java.io.FileOutputStream(file);
+            out.write(token.getBytes("UTF-8"));
+            out.close();
+            try {
+                new ProcessBuilder("/system/bin/chmod", "600", file.getAbsolutePath())
+                        .redirectErrorStream(true).start();
+            } catch (Throwable ignored) {
+            }
+            Log.i(TAG, "device bridge token created at " + file.getAbsolutePath());
+            return token;
+        } catch (Throwable t) {
+            Log.w(TAG, "device bridge token unavailable; the bridge stays closed", t);
+            return null;
+        }
     }
 
     /** Read up to the end of headers; null when the peer sent nothing. */

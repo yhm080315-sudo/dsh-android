@@ -9,13 +9,24 @@
 | **@deepseek-ai/dsh** 及其依赖（177 个包） | MIT | 随附许可与版权声明 |
 | Node.js（Termux bionic 构建） | MIT | 随附许可 |
 | ripgrep | MIT / Unlicense（双许可） | 随附许可 |
-| GNU coreutils（cat/ls/cp/…） | **GPL-3.0** | ⚠️ 分发二进制需提供对应源码或书面要约 |
+| GNU coreutils（cat/ls/cp/…） | **GPL-3.0** | ⚠️ 需提供 **Termux 构建版本的对应源码** + 许可证全文 |
 | bash | **GPL-3.0** | 同上 |
 | busybox（若使用） | **GPL-2.0** | 同上 |
 
 **关于 GPL**：把 GPL 二进制打包进 APK 属于「分发」，因此需要履行 GPL 义务。
-最省事的做法是**不在仓库里提交这些二进制**，而是在构建时从发行方（如 Termux 仓库）下载，
-并在发布页附上源码获取方式。`scripts/` 里的脚本即按此方式工作。
+
+注意：**只链到 gnu.org 是不够的**。所分发的二进制来自 Termux 的构建，
+它们带了发行方的补丁，属于「修改版本」，因此「对应源码」指的是 Termux 构建它们时用的那份源码，
+而不是上游原始版本。正确的指向是 Termux 对应包目录 + 构建修订：
+
+| 二进制 | 对应源码 |
+|---|---|
+| GNU coreutils | https://github.com/termux/termux-packages/tree/master/packages/coreutils |
+| bash | https://github.com/termux/termux-packages/tree/master/packages/bash |
+| busybox（若使用） | https://github.com/termux/termux-packages/tree/master/packages/busybox |
+
+同时请随分发包附上 **GPL 许可证全文**（`COPYING`），并注明修改情况（Termux 的补丁）。
+最省事的做法仍然是**不在仓库里提交这些二进制**，改为构建时下载——`scripts/` 即按此方式工作。
 
 ## 明确的排除项
 

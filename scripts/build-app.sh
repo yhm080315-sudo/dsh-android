@@ -10,7 +10,23 @@ APP="$HERE/app"
 BT="${BUILD_TOOLS:-/usr/lib/android-sdk/build-tools/29.0.3}"
 PLATFORM_JAR="${ANDROID_JAR:-/tmp/plat30/android-11/android.jar}"
 KEYSTORE="${KEYSTORE:-$HERE/keystore.jks}"
-KS_PASS="${KS_PASS:-dshandroid}"
+# No default password: this keystore's password is the only thing protecting the
+# app's update chain (Android trusts applicationId + signing certificate). A
+# default that ships in the repository means everyone's key has the same,
+# publicly known password.
+KS_PASS="${KS_PASS:-}"
+if [ -z "$KS_PASS" ]; then
+    if [ -f "$HERE/keystore.pass" ]; then
+        KS_PASS="$(cat "$HERE/keystore.pass")"
+    else
+        echo "KS_PASS is not set." >&2
+        echo "  First build:  KS_PASS='<pick a strong password>' bash scripts/build-app.sh" >&2
+        echo "  The keystore is created on first run and its password is written to keystore.pass (0600)." >&2
+        echo "  Losing that file means you can never publish an update for the same app id." >&2
+        exit 1
+    fi
+fi
+
 KS_ALIAS="${KS_ALIAS:-dshandroid}"
 STAGE="${STAGE_DIR:-$APP/asset-stage}"
 ASSETS="$APP/assets"
