@@ -386,38 +386,101 @@ public class MainActivity extends Activity implements NodeServer.Listener {
      * stroke for the rim light. Stacked and rounded together, the three read as one
      * piece of glass rather than three rectangles.
      */
-    private android.graphics.drawable.Drawable glass(int tint, float radiusDp, boolean pressed) {
-        float r = radiusDp * getResources().getDisplayMetrics().density;
-        int sheenTop = pressed ? 0x59FFFFFF : 0x38FFFFFF;
-        int rim = pressed ? 0x8CFFFFFF : 0x59FFFFFF;
-        int body = tint;
+    /**
+     * One piece of iOS-26-style glass, painted directly.
+     *
+     * A stack of GradientDrawables could not express what makes the material read
+     * as glass: the sheen has to be concentrated in the top half (a full-height
+     * gradient just looks washed out), the rim has to be bright at the top and fade
+     * towards the bottom, and there is a faint inner shading along the lower edge.
+     * Those are stop positions and per-edge alphas, so this paints them by hand.
+     */
+    private static final class GlassDrawable extends android.graphics.drawable.Drawable {
+        private final android.graphics.Paint body = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Paint sheen = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Paint shade = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final android.graphics.Paint rim = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+        private final float radius;
+        private final float rimWidth;
+        private final int bodyColor;
+        private final boolean pressed;
 
-        android.graphics.drawable.GradientDrawable fill =
-                new android.graphics.drawable.GradientDrawable();
-        fill.setCornerRadius(r);
-        fill.setColor(body);
+        GlassDrawable(int bodyColor, float radius, float rimWidth, boolean pressed) {
+            this.bodyColor = bodyColor;
+            this.radius = radius;
+            this.rimWidth = rimWidth;
+            this.pressed = pressed;
+            body.setStyle(android.graphics.Paint.Style.FILL);
+            sheen.setStyle(android.graphics.Paint.Style.FILL);
+            shade.setStyle(android.graphics.Paint.Style.FILL);
+            rim.setStyle(android.graphics.Paint.Style.STROKE);
+            rim.setStrokeWidth(rimWidth);
+        }
 
-        android.graphics.drawable.GradientDrawable sheen =
-                new android.graphics.drawable.GradientDrawable(
-                        android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
-                        new int[]{sheenTop, 0x0FFFFFFF, 0x00FFFFFF});
-        sheen.setCornerRadius(r);
+        @Override
+        public void draw(android.graphics.Canvas canvas) {
+            android.graphics.RectF r = new android.graphics.RectF(
+                    rimWidth / 2f, rimWidth / 2f,
+                    getBounds().width() - rimWidth / 2f, getBounds().height() - rimWidth / 2f);
+            canvas.save();
+            canvas.translate(getBounds().left, getBounds().top);
 
-        android.graphics.drawable.GradientDrawable edge =
-                new android.graphics.drawable.GradientDrawable();
-        edge.setCornerRadius(r);
-        edge.setColor(0x00000000);
-        edge.setStroke(Math.max(1, (int) getResources().getDisplayMetrics().density), rim);
+            // 1) the body: translucent, so the photo shows through
+            body.setColor(bodyColor);
+            canvas.drawRoundRect(r, radius, radius, body);
 
-        android.graphics.drawable.LayerDrawable layers =
-                new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[]{
-                        fill, sheen, edge
-                });
+            // 2) specular sheen: concentrated in the top 45%, fading out fast
+            sheen.setShader(new android.graphics.LinearGradient(
+                    0, r.top, 0, r.bottom,
+                    new int[]{pressed ? 0x5CFFFFFF : 0x3DFFFFFF, 0x14FFFFFF, 0x08FFFFFF, 0x00FFFFFF},
+                    new float[]{0f, 0.32f, 0.62f, 1f},
+                    android.graphics.Shader.TileMode.CLAMP));
+            canvas.drawRoundRect(r, radius, radius, sheen);
+            sheen.setShader(null);
 
-        android.graphics.drawable.StateListDrawable states =
-                new android.graphics.drawable.StateListDrawable();
-        states.addState(new int[]{android.R.attr.state_pressed}, layers);
-        states.addState(new int[]{}, layers);
+            // 3) faint inner shading along the lower edge, like real glass
+            shade.setShader(new android.graphics.LinearGradient(
+                    0, r.top + r.height() * 0.55f, 0, r.bottom,
+                    new int[]{0x00000000, 0x14000000},
+                    null, android.graphics.Shader.TileMode.CLAMP));
+            canvas.drawRoundRect(r, radius, radius, shade);
+            shade.setShader(null);
+
+            // 4) rim light: brighter at the top, dimmer at the bottom
+            rim.setShader(new android.graphics.LinearGradient(
+                    0, r.top, 0, r.bottom,
+                    new int[]{pressed ? 0xA6FFFFFF : 0x73FFFFFF, 0x2EFFFFFF},
+                    null, android.graphics.Shader.TileMode.CLAMP));
+            canvas.drawRoundRect(r, radius, radius, rim);
+            rim.setShader(null);
+
+            canvas.restore();
+        }
+
+        @Override
+        public void setAlpha(int alpha) {
+        }
+
+        @Override
+        public void setColorFilter(android.graphics.ColorFilter filter) {
+        }
+
+        @Override
+        public int getOpacity() {
+            return android.graphics.PixelFormat.TRANSLUCENT;
+        }
+    }
+
+    /** Glass that brightens under the finger, like the real material. */
+    private android.graphics.drawable.Drawable glassSurface(int bodyColor, float radiusDp) {
+        float d = getResources().getDisplayMetrics().density;
+        float r = radiusDp * d;
+        float rimW = Math.max(1f, d);
+        final GlassDrawable normal = new GlassDrawable(bodyColor, r, rimW, false);
+        final GlassDrawable down = new GlassDrawable(bodyColor, r, rimW, true);
+        android.graphics.drawable.StateListDrawable states = new android.graphics.drawable.StateListDrawable();
+        states.addState(new int[]{android.R.attr.state_pressed}, down);
+        states.addState(new int[]{}, normal);
         return states;
     }
 
@@ -435,8 +498,11 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         b.setTypeface(android.graphics.Typeface.DEFAULT, primary
                 ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
         // Tinted glass for the primary action, neutral glass for the rest.
-        b.setBackground(glass(primary ? 0x66 + (alpha(theme.primary) & 0x00FFFFFF) : 0x24FFFFFF,
-                capsuleRadius(), false));
+        // Tinted glass for the primary action, neutral glass for the rest. The body
+        // is deliberately light: on a dark photo, translucent white reads as frosted.
+        b.setBackground(glassSurface(primary
+                ? (alpha(theme.primary) & 0x00FFFFFF) | 0x73000000
+                : 0x3DFFFFFF, capsuleRadius()));
         b.setPadding(0, 0, 0, 0);
         if (android.os.Build.VERSION.SDK_INT >= 21) {
             b.setElevation(6 * getResources().getDisplayMetrics().density);
@@ -525,7 +591,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         statusView = new TextView(this);
         statusView.setTextSize(13f);
         statusView.setTextColor(theme.warn);
-        statusView.setBackground(outlined(alpha(theme.card), alpha(theme.stroke), 12f));
+        statusView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x73000000, 18f));
         int sp = (int) (12 * d);
         statusView.setPadding(sp, sp, sp, sp);
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
@@ -620,7 +686,12 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logView.setTypeface(android.graphics.Typeface.MONOSPACE);
         logView.setLineSpacing(0f, 1.15f);
         logView.setTextIsSelectable(true);
-        logView.setBackground(plate(alpha(theme.card), 12f));
+        // Same glass as the buttons: on a photo, a flat dark card is what made the
+        // log look like a different app bolted onto this screen.
+        logView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x8A000000, 20f));
+        if (android.os.Build.VERSION.SDK_INT >= 21) {
+            logView.setElevation(4 * getResources().getDisplayMetrics().density);
+        }
         logView.setPadding(sp, sp, sp, sp);
         logView.setMovementMethod(new ScrollingMovementMethod());
         ScrollView logCard = new ScrollView(this);
@@ -700,11 +771,16 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                         // Lift the photo itself instead of dimming it: a plain alpha
                         // over the dark base was what made every wallpaper look dull.
                         android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
-                        float gain = 255f * (1f - theme.brightness);
+                        // A POSITIVE offset lifts the midtones. The first version used
+                        // 255*(1-brightness), which is negative for any boost -- it
+                        // brightened only the highlights and made midtones DARKER
+                        // (128 * 1.14 - 35.7 = 110). That is why every wallpaper still
+                        // looked dim.
+                        float lift = 255f * (theme.brightness - 1f);
                         cm.set(new float[]{
-                                theme.brightness, 0, 0, 0, gain,
-                                0, theme.brightness, 0, 0, gain,
-                                0, 0, theme.brightness, 0, gain,
+                                theme.brightness, 0, 0, 0, lift,
+                                0, theme.brightness, 0, 0, lift,
+                                0, 0, theme.brightness, 0, lift,
                                 0, 0, 0, 1, 0
                         });
                         backgroundView.setColorFilter(
@@ -715,7 +791,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                         android.graphics.drawable.GradientDrawable veil =
                                 new android.graphics.drawable.GradientDrawable(
                                         android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
-                                        new int[]{0xB3000000, 0x59000000, 0x1A000000});
+                                        new int[]{0x8C000000, 0x3D000000, 0x0F000000});
                         veilView.setBackground(veil);
                         veilView.setAlpha(Math.max(0f, Math.min(1f, theme.veil)));
                         veilView.setVisibility(View.VISIBLE);
