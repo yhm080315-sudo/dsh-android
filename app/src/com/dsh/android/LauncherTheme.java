@@ -54,8 +54,19 @@ final class LauncherTheme {
     int err = 0xFFF87171;
     int log = 0xFFA8C0DC;
 
-    /** Opacity of the background image: what is left after the scrim. */
-    float scrim = 0.62f;
+    /**
+     * Opacity of the background image.
+     *
+     * This used to default to 0.62, which dimmed the picture into the dark base
+     * colour and read as "too dark" no matter how bright the photo was. Legibility
+     * now comes from a top-heavy veil and from the glass surfaces on top, so the
+     * image itself can stay nearly opaque.
+     */
+    float scrim = 0.96f;
+    /** Multiplier applied to the image's own brightness (1 = untouched). */
+    float brightness = 1.14f;
+    /** Strength of the vertical veil over the image, for text legibility. */
+    float veil = 0.5f;
     /** Opacity of the panels drawn over that image; 1 = opaque. */
     float cardOpacity = 0.88f;
     /** Corner radius of the cards, in dp. */
@@ -172,6 +183,10 @@ final class LauncherTheme {
                     log = color(value, log);
                 } else if (key.equals("scrim")) {
                     scrim = opacity(value, scrim);
+                } else if (key.equals("brightness")) {
+                    brightness = number(value, brightness);
+                } else if (key.equals("veil")) {
+                    veil = opacity(value, veil);
                 } else if (key.equals("card_opacity")) {
                     cardOpacity = opacity(value, cardOpacity);
                 } else if (key.equals("radius")) {
@@ -333,6 +348,8 @@ final class LauncherTheme {
             sb.append("\n");
             sb.append("# background = /sdcard/Pictures/wallpaper.jpg\n");
             sb.append("scrim = ").append(trim(scrim)).append("\n");
+        sb.append("brightness = ").append(trim(brightness)).append("\n");
+        sb.append("veil = ").append(trim(veil)).append("\n");
             sb.append("card_opacity = ").append(trim(cardOpacity)).append("\n");
             sb.append("radius = ").append(trim(radius)).append("\n");
             sb.append("title = ").append(title).append("\n");

@@ -54,6 +54,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
      */
     private LauncherTheme theme;
     private ImageView backgroundView;
+    /** Vertical veil over the photo: keeps light text readable while leaving the
+     *  picture bright. Applied above the image, below everything else. */
+    private View veilView;
     /** Bounded retries: the image only becomes readable once access is granted. */
     private int backgroundAttempts;
     /** Set while the system picker is open for a page's file input. */
@@ -372,6 +375,57 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         return d;
     }
 
+    /**
+     * iOS 26-ish "liquid glass" surface: a translucent body, a top sheen and a
+     * bright rim, all sharing one large corner radius.
+     *
+     * Android cannot backdrop-blur the content behind a view (RenderEffect needs
+     * API 31, and this app targets 28), so the frosted look is approximated with
+     * layers: a translucent body showing the photo through, a white-to-transparent
+     * vertical gradient standing in for the specular highlight, and a thin bright
+     * stroke for the rim light. Stacked and rounded together, the three read as one
+     * piece of glass rather than three rectangles.
+     */
+    private android.graphics.drawable.Drawable glass(int tint, float radiusDp, boolean pressed) {
+        float r = radiusDp * getResources().getDisplayMetrics().density;
+        int sheenTop = pressed ? 0x59FFFFFF : 0x38FFFFFF;
+        int rim = pressed ? 0x8CFFFFFF : 0x59FFFFFF;
+        int body = tint;
+
+        android.graphics.drawable.GradientDrawable fill =
+                new android.graphics.drawable.GradientDrawable();
+        fill.setCornerRadius(r);
+        fill.setColor(body);
+
+        android.graphics.drawable.GradientDrawable sheen =
+                new android.graphics.drawable.GradientDrawable(
+                        android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                        new int[]{sheenTop, 0x0FFFFFFF, 0x00FFFFFF});
+        sheen.setCornerRadius(r);
+
+        android.graphics.drawable.GradientDrawable edge =
+                new android.graphics.drawable.GradientDrawable();
+        edge.setCornerRadius(r);
+        edge.setColor(0x00000000);
+        edge.setStroke(Math.max(1, (int) getResources().getDisplayMetrics().density), rim);
+
+        android.graphics.drawable.LayerDrawable layers =
+                new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[]{
+                        fill, sheen, edge
+                });
+
+        android.graphics.drawable.StateListDrawable states =
+                new android.graphics.drawable.StateListDrawable();
+        states.addState(new int[]{android.R.attr.state_pressed}, layers);
+        states.addState(new int[]{}, layers);
+        return states;
+    }
+
+    /** Capsule radius for buttons: half the height, like the iOS 26 control shapes. */
+    private float capsuleRadius() {
+        return 23f;
+    }
+
     private Button action(String label, boolean primary) {
         Button b = new Button(this);
         b.setText(label);
@@ -380,10 +434,14 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         b.setTextColor(primary ? 0xFFFFFFFF : theme.text);
         b.setTypeface(android.graphics.Typeface.DEFAULT, primary
                 ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
-        b.setBackground(primary
-                ? plate(alpha(theme.primary), theme.radius)
-                : outlined(alpha(theme.card), alpha(theme.stroke), theme.radius));
+        // Tinted glass for the primary action, neutral glass for the rest.
+        b.setBackground(glass(primary ? 0x66 + (alpha(theme.primary) & 0x00FFFFFF) : 0x24FFFFFF,
+                capsuleRadius(), false));
         b.setPadding(0, 0, 0, 0);
+        if (android.os.Build.VERSION.SDK_INT >= 21) {
+            b.setElevation(6 * getResources().getDisplayMetrics().density);
+        }
+        b.setShadowLayer(6 * getResources().getDisplayMetrics().density, 0, 0, 0x66000000);
         float h = 46 * getResources().getDisplayMetrics().density;
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, (int) h);
@@ -419,9 +477,21 @@ public class MainActivity extends Activity implements NodeServer.Listener {
          * bitmap is actually in memory, so the flat palette shows first and the
          * image fades in rather than the screen flashing empty.
          */
+        veilView = new View(this);
+        veilView.setVisibility(View.GONE);
+        root.addView(veilView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         backgroundView = new ImageView(this);
         backgroundView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        // Re-add the veil so it sits ABOVE the image (FrameLayout stacks in
+        // insertion order, and the image was added after the veil above).
+        root.removeView(veilView);
+        root.addView(veilView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         backgroundView.setVisibility(View.GONE);
+        // Above the veil: FrameLayout stacks in insertion order, so add the image
+        // first and re-add the veil on top of it.
         root.addView(backgroundView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -627,6 +697,28 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                         backgroundAttempts = 99;
                         backgroundView.setImageBitmap(bitmap);
                         backgroundView.setAlpha(theme.scrim);
+                        // Lift the photo itself instead of dimming it: a plain alpha
+                        // over the dark base was what made every wallpaper look dull.
+                        android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
+                        float gain = 255f * (1f - theme.brightness);
+                        cm.set(new float[]{
+                                theme.brightness, 0, 0, 0, gain,
+                                0, theme.brightness, 0, 0, gain,
+                                0, 0, theme.brightness, 0, gain,
+                                0, 0, 0, 1, 0
+                        });
+                        backgroundView.setColorFilter(
+                                new android.graphics.ColorMatrixColorFilter(cm));
+                        // Top-heavy veil: enough contrast for the title and status at
+                        // the top, almost nothing by the time the log reaches the
+                        // bottom, so the photo stays bright where it can be seen.
+                        android.graphics.drawable.GradientDrawable veil =
+                                new android.graphics.drawable.GradientDrawable(
+                                        android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+                                        new int[]{0xB3000000, 0x59000000, 0x1A000000});
+                        veilView.setBackground(veil);
+                        veilView.setAlpha(Math.max(0f, Math.min(1f, theme.veil)));
+                        veilView.setVisibility(View.VISIBLE);
                         backgroundView.setVisibility(View.VISIBLE);
                         logLine("launcher theme: background applied "
                                 + bitmap.getWidth() + "x" + bitmap.getHeight()
