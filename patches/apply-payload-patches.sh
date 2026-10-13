@@ -155,6 +155,43 @@ const STARTUP_ENVIRONMENT_NAMES = new Set([
     "P13 ptc worker 继承运行时必需的环境变量",
 )
 
+# ── P14: Android 上「用外部程序打开文件」永远不可用 ──────────────────────────
+# 交付物卡片的「打开」按钮会问主机有没有可用的应用，而 specFor() 只认
+# darwin / win32 / linux —— Android 直接返回 undefined，于是任何应用都判定为
+# 不可用，界面显示「此主机没有可用的桌面，无法使用外部程序打开文件」。
+#
+# 两处改动：让 specFor 认 android，并在目录里加一个 android 条目，
+# 指向载荷自带的 dsh-open（它把文件交给 App 的桥去分享，那是 Android 上
+# 「用外部程序打开」的正确形态：系统弹出应用选择器）。
+patch(
+    "@deepseek-ai/dsh-host-open-in-app/lib/index.js",
+    """	return platform === "darwin" || platform === "win32" || platform === "linux" ? app.platforms[platform] : void 0;""",
+    """	/*
+	 * Android counts too: there is no desktop here, but "open in an external
+	 * application" still has a meaning -- the system share sheet, reached through
+	 * the launcher shipped in usr/bin/dsh-open. Leaving android out of this list
+	 * is what made the deliverables panel claim no desktop was available.
+	 */
+	return platform === "darwin" || platform === "win32" || platform === "linux" || platform === "android" ? app.platforms[platform] : void 0;""",
+    "Android counts too: there is no desktop here",
+    "P14a 让 open-in-app 认 android 平台",
+)
+patch(
+    "@deepseek-ai/dsh-host-open-in-app/lib/index.js",
+    """	{
+		id: "filemanager",
+		platforms: { linux: spec(desktopCli("xdg-open")) }""",
+    """	{
+		id: "android",
+		platforms: { android: spec(cli("dsh-open")) }
+	},
+	{
+		id: "filemanager",
+		platforms: { linux: spec(desktopCli("xdg-open")) }""",
+    'id: "android"',
+    "P14b 目录里加 Android 条目",
+)
+
 # ── P5: 图片处理不依赖原生 sharp（备用路径）────────────────────────────────
 # 说明：完整的纯 JS 头部解析实现较长，这里只做「不因缺少 sharp 而整体失败」的兜底；
 # 若需要完整的图片能力，请参考 docs/PITFALLS.md 第 5 条自行补全解析器。

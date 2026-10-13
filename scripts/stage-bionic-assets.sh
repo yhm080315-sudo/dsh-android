@@ -109,3 +109,11 @@ if [ -f "$HERE/tools/dshdev.js" ]; then
   chmod 755 "$STAGE/runtime/usr/bin/dshdev" "$STAGE/runtime/usr/bin/dshdev.js"
   echo "  bin  dshdev (device bridge client)"
 fi
+
+# dsh-open: 在外部应用里打开文件。Android 上没有桌面，正确形态是分享到其它应用
+# （系统弹出应用选择器），由 App 的桥完成。open-in-app 插件按 PATH 找这个名字。
+if [ -f "$HERE/tools/dsh-open.sh" ]; then
+  cp -f "$HERE/tools/dsh-open.sh" "$STAGE/runtime/usr/bin/dsh-open"
+  chmod 755 "$STAGE/runtime/usr/bin/dsh-open"
+  echo "  bin  dsh-open (open a file in another app)"
+fi
