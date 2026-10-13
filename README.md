@@ -15,6 +15,28 @@
 - 主界面、插件、皮肤、agent 全部跟桌面端一致
 - 额外内置一块**设备控制接口**（截屏 / 点按 / 滑动 / 输入 / OCR / 启动应用），走 `su` 通道
 - 会话、附件、凭据都存在应用私有目录，升级不丢
+- 启动时那块**原生控制台也能换色、加背景图**，改手机上的一个文本文件即可，不用重新打包
+
+---
+
+## 启动界面外观
+
+App 启动后先显示的是原生控制台（标题 / 状态 / 按钮 / 运行日志），它读手机上的配置：
+
+```ini
+# /sdcard/DSH/launcher/theme.conf
+background   = /sdcard/Pictures/wallpaper.jpg   # 也可以只丢一张 bg.jpg 到同目录
+scrim        = 0.62      # 背景图不透明度（压暗蒙版）
+card_opacity = 0.88      # 面板/卡片不透明度，有背景图时才有意义
+bg           = #0B1220   # 底色，也是图片的兜底色
+card         = #16223C
+primary      = #4D6BFE
+text         = #EAF0FA
+```
+
+改完**下次启动生效**。没授权 / 图读不出来时自动退回纯色，界面照常工作。
+App 首次运行会写一份带全部键和默认值的 `theme.example.conf` 供照抄。
+完整键表、失败回退、排查表见 **[docs/APPEARANCE.md](docs/APPEARANCE.md)**。
 
 ---
 
@@ -93,6 +115,7 @@ bash patches/apply-payload-patches.sh <runtime 目录>
 ┌─────────────────────────────────────────────────────────┐
 │ MainActivity                                            │
 │  ├─ 日志面板 / 中文控制按钮 / WebView 宿主              │
+│  ├─ LauncherTheme   控制台配色 + 背景图（读 /sdcard 配置）│
 │  ├─ onShowFileChooser → 系统选择器 → 本地暂存 → 页面    │
 │  └─ onConsoleMessage → 浏览器控制台写入应用日志         │
 ├─────────────────────────────────────────────────────────┤

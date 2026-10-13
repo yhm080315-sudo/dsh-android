@@ -18,6 +18,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -46,9 +47,20 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     private Button rootButton;
     private Button resumeButton;
     private TextView logChip;
+    /**
+     * Console appearance (palette + optional background image), read from
+     * shared storage at every launch so the look can be changed without
+     * rebuilding the APK. See {@link LauncherTheme}.
+     */
+    private LauncherTheme theme;
+    private ImageView backgroundView;
+    /** Bounded retries: the image only becomes readable once access is granted. */
+    private int backgroundAttempts;
     /** Set while the system picker is open for a page's file input. */
     private android.webkit.ValueCallback<Uri[]> pendingFileCallback;
     private static final int REQUEST_FILE_CHOOSER = 4001;
+    /** Picking an image to use as the launcher console background. */
+    private static final int REQUEST_BACKGROUND = 4002;
     /** When the WebView attached, to timestamp resource failures against it. */
     private volatile long webAttachedAt;
     private File pendingApk;
@@ -64,7 +76,11 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         if (new java.io.File(getFilesDir(), "diagnostics").isFile()) {
             diagnostics = true;
         }
+        theme = LauncherTheme.load(this);
         buildUi();
+        theme.writeExample();
+        logLine("launcher theme: " + theme.describe());
+        applyBackgroundIfNeeded();
 
         NodeServer.addListener(this);
         // Identify the running build in the log: several were shipped while this
@@ -263,7 +279,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                     public void run() {
                         updateButton.setEnabled(true);
                         statusView.setText("更新失败：" + reason);
-                        statusView.setTextColor(C_ERR);
+                        statusView.setTextColor(theme.err);
                         logView.append("[" + prefix + "] failed: " + reason + "\n");
                     }
                 });
@@ -337,17 +353,11 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logView.append(sb.toString());
     }
 
-    // ---- palette (matches the desktop client's dark shell) -------------------
-    private static final int C_BG = 0xFF101319;
-    private static final int C_CARD = 0xFF1A1F27;
-    private static final int C_CARD_PRESSED = 0xFF232A34;
-    private static final int C_PRIMARY = 0xFF4D6BFE;   // DeepSeek blue
-    private static final int C_TEXT = 0xFFE8EDF5;
-    private static final int C_DIM = 0xFF8A98AB;
-    private static final int C_OK = 0xFF4ADE80;
-    private static final int C_WARN = 0xFFFBBF24;
-    private static final int C_ERR = 0xFFF87171;
-    private static final int C_LOG = 0xFF9FB3C8;
+    // ---- palette ------------------------------------------------------------
+    // The defaults live in LauncherTheme now, and every one of them can be
+    // overridden from /sdcard/DSH/launcher/theme.conf -- this screen is the one
+    // users stare at while the runtime unpacks, and it used to be the only part
+    // of the app whose colours could not be changed without a rebuild.
 
     private static android.graphics.drawable.GradientDrawable plate(int color, float radius) {
         android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
@@ -367,10 +377,12 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         b.setText(label);
         b.setAllCaps(false);
         b.setTextSize(15f);
-        b.setTextColor(primary ? 0xFFFFFFFF : C_TEXT);
+        b.setTextColor(primary ? 0xFFFFFFFF : theme.text);
         b.setTypeface(android.graphics.Typeface.DEFAULT, primary
                 ? android.graphics.Typeface.BOLD : android.graphics.Typeface.NORMAL);
-        b.setBackground(primary ? plate(C_PRIMARY, 14f) : outlined(C_CARD, 0xFF2A323D, 14f));
+        b.setBackground(primary
+                ? plate(alpha(theme.primary), theme.radius)
+                : outlined(alpha(theme.card), alpha(theme.stroke), theme.radius));
         b.setPadding(0, 0, 0, 0);
         float h = 46 * getResources().getDisplayMetrics().density;
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -380,26 +392,48 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         return b;
     }
 
+    /** Rebuild the console with the current theme, keeping the log text. */
+    private View buildUiAgain() {
+        CharSequence kept = logView == null ? "" : logView.getText();
+        buildUi();
+        if (logView != null && kept.length() > 0) {
+            logView.setText(kept);
+        }
+        return root;
+    }
+
     private void buildUi() {
         getWindow().setBackgroundDrawable(
-                new android.graphics.drawable.ColorDrawable(C_BG));
+                new android.graphics.drawable.ColorDrawable(theme.bg));
         if (Build.VERSION.SDK_INT >= 21) {
-            getWindow().setStatusBarColor(C_BG);
-            getWindow().setNavigationBarColor(C_BG);
+            getWindow().setStatusBarColor(theme.bg);
+            getWindow().setNavigationBarColor(theme.bg);
         }
         root = new FrameLayout(this);
         float d = getResources().getDisplayMetrics().density;
         int pad = (int) (18 * d);
 
+        /*
+         * Sits behind the console when a background image is configured, and
+         * stays empty otherwise. It is added first and kept invisible until the
+         * bitmap is actually in memory, so the flat palette shows first and the
+         * image fades in rather than the screen flashing empty.
+         */
+        backgroundView = new ImageView(this);
+        backgroundView.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        backgroundView.setVisibility(View.GONE);
+        root.addView(backgroundView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         logPanel = new LinearLayout(this);
         logPanel.setOrientation(LinearLayout.VERTICAL);
-        logPanel.setBackgroundColor(C_BG);
+        logPanel.setBackgroundColor(alpha(theme.bg));
         logPanel.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("DeepSeek Harness");
+        title.setText(theme.title);
         title.setTextSize(21f);
-        title.setTextColor(C_TEXT);
+        title.setTextColor(theme.text);
         title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
         logPanel.addView(title);
 
@@ -412,7 +446,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             version.setText("版本 未知");
         }
         version.setTextSize(12f);
-        version.setTextColor(C_DIM);
+        version.setTextColor(theme.dim);
         LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         vlp.bottomMargin = (int) (14 * d);
@@ -420,8 +454,8 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
         statusView = new TextView(this);
         statusView.setTextSize(13f);
-        statusView.setTextColor(C_WARN);
-        statusView.setBackground(outlined(C_CARD, 0xFF2A323D, 12f));
+        statusView.setTextColor(theme.warn);
+        statusView.setBackground(outlined(alpha(theme.card), alpha(theme.stroke), 12f));
         int sp = (int) (12 * d);
         statusView.setPadding(sp, sp, sp, sp);
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
@@ -439,6 +473,15 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             }
         });
         logPanel.addView(resumeButton);
+
+        Button bgButton = action("换背景图", false);
+        bgButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                pickBackground();
+            }
+        });
+        logPanel.addView(bgButton);
 
         rootButton = action("授予 root 权限", false);
         rootButton.setOnClickListener(new View.OnClickListener() {
@@ -494,7 +537,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         TextView logLabel = new TextView(this);
         logLabel.setText("运行日志");
         logLabel.setTextSize(12f);
-        logLabel.setTextColor(C_DIM);
+        logLabel.setTextColor(theme.dim);
         LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         llp.topMargin = (int) (8 * d);
@@ -503,17 +546,17 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
         logView = new TextView(this);
         logView.setTextSize(11f);
-        logView.setTextColor(C_LOG);
+        logView.setTextColor(theme.log);
         logView.setTypeface(android.graphics.Typeface.MONOSPACE);
         logView.setLineSpacing(0f, 1.15f);
         logView.setTextIsSelectable(true);
-        logView.setBackground(plate(C_CARD, 12f));
+        logView.setBackground(plate(alpha(theme.card), 12f));
         logView.setPadding(sp, sp, sp, sp);
         logView.setMovementMethod(new ScrollingMovementMethod());
-        ScrollView scroll = new ScrollView(this);
-        scroll.setBackground(plate(C_CARD, 12f));
-        scroll.addView(logView);
-        logPanel.addView(scroll, new LinearLayout.LayoutParams(
+        ScrollView logCard = new ScrollView(this);
+        logCard.setBackground(plate(alpha(theme.card), 12f));
+        logCard.addView(logView);
+        logPanel.addView(logCard, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         root.addView(logPanel, new FrameLayout.LayoutParams(
@@ -523,8 +566,8 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logChip = new TextView(this);
         logChip.setText("日志");
         logChip.setTextSize(13f);
-        logChip.setTextColor(C_TEXT);
-        logChip.setBackground(plate(C_CARD, 20f));
+        logChip.setTextColor(theme.text);
+        logChip.setBackground(plate(alpha(theme.card), 20f));
         int cp = (int) (14 * d);
         logChip.setPadding(cp, (int) (8 * d), cp, (int) (8 * d));
         logChip.setOnClickListener(new View.OnClickListener() {
@@ -542,6 +585,62 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         root.addView(logChip, chipLp);
 
         setContentView(root);
+    }
+
+    /**
+     * Card/panel fills, at the opacity the theme asks for. With a background
+     * image in play the console turns into glass over it; with none the panels
+     * stay fully opaque, which is exactly the flat console of before.
+     */
+    private int alpha(int color) {
+        return LauncherTheme.withOpacity(color, theme.panelOpacity());
+    }
+
+    /**
+     * Decode the configured background off the UI thread and fade it in.
+     *
+     * Reading the file can fail for a reason the user can fix -- no file access
+     * yet -- so this is retried from onResume (which also runs after the
+     * settings screen the storage button opens) instead of being attempted once
+     * and forgotten. The attempts are capped because a genuinely unreadable
+     * image should cost a few log lines, not a decode per resume.
+     */
+    private void applyBackgroundIfNeeded() {
+        if (theme == null || theme.background == null || backgroundAttempts >= 3) {
+            return;
+        }
+        backgroundAttempts++;
+        final int target = getResources().getDisplayMetrics().widthPixels;
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final android.graphics.Bitmap bitmap = theme.decode(target);
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (bitmap == null) {
+                            logLine("launcher theme: background unreadable or undecodable ("
+                                    + theme.background.getAbsolutePath()
+                                    + "); keeping the flat palette");
+                            return;
+                        }
+                        backgroundAttempts = 99;
+                        backgroundView.setImageBitmap(bitmap);
+                        backgroundView.setAlpha(theme.scrim);
+                        backgroundView.setVisibility(View.VISIBLE);
+                        logLine("launcher theme: background applied "
+                                + bitmap.getWidth() + "x" + bitmap.getHeight()
+                                + " alpha=" + theme.scrim);
+                    }
+                });
+            }
+        }, "dsh-theme").start();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        applyBackgroundIfNeeded();
     }
 
     /**
@@ -763,7 +862,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                 }
             }
         });
-        web.setBackgroundColor(0xFF101418);
+        web.setBackgroundColor(theme.bg);
         root.addView(web, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         webAttached = true;
@@ -826,7 +925,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             @Override
             public void run() {
                 statusView.setText("已就绪：" + url);
-                statusView.setTextColor(C_OK);
+                statusView.setTextColor(theme.ok);
             }
         });
         // Only hand the page to the WebView once its client plugin graph exists.
@@ -839,7 +938,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             @Override
             public void run() {
                 statusView.setText("运行环境已退出（代码 " + code + "），详见日志");
-                statusView.setTextColor(C_ERR);
+                statusView.setTextColor(theme.err);
                 showLog();
             }
         });
@@ -862,8 +961,113 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
     // ------------------------------------------------------- file chooser
 
+    /**
+     * Pick an image and make it this screen's background.
+     *
+     * The theme already supports a zero-config background: any file named
+     * bg.jpg/bg.jpeg/bg.png/bg.webp in /sdcard/DSH/launcher. So "quickly change
+     * the background" is just a picker plus a copy -- no config file to edit, and
+     * the on-screen result is immediate.
+     *
+     * A DSH plugin could not do this: this console is the native screen that is
+     * shown *before* the harness and its plugins exist. Writing the same file is
+     * what a plugin would have to do anyway.
+     */
+    private void pickBackground() {
+        try {
+            Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            pick.addCategory(Intent.CATEGORY_OPENABLE);
+            pick.setType("image/*");
+            startActivityForResult(pick, REQUEST_BACKGROUND);
+        } catch (Throwable t) {
+            logLine("background picker failed: " + t);
+        }
+    }
+
+    /** Copy the chosen image to /sdcard/DSH/launcher/bg<ext> and re-apply it. */
+    private void applyBackground(Intent data) {
+        java.io.InputStream in = null;
+        java.io.OutputStream out = null;
+        try {
+            android.net.Uri source = data == null ? null : data.getData();
+            if (source == null) {
+                logLine("background: nothing selected");
+                return;
+            }
+            String mime = getContentResolver().getType(source);
+            String ext = "jpg";
+            if (mime != null) {
+                if (mime.contains("png")) {
+                    ext = "png";
+                } else if (mime.contains("webp")) {
+                    ext = "webp";
+                } else if (mime.contains("jpeg") || mime.contains("jpg")) {
+                    ext = "jpg";
+                }
+            }
+            File dir = new File(LauncherTheme.SHARED_DIR);
+            if (!dir.mkdirs() && !dir.isDirectory()) {
+                logLine("background: cannot create " + dir);
+                return;
+            }
+            // Other spellings are read too, but leaving them behind would make the
+            // old picture win over the new one on the next start.
+            for (String name : new String[]{"bg.jpg", "bg.jpeg", "bg.png", "bg.webp"}) {
+                File stale = new File(dir, name);
+                if (stale.isFile()) {
+                    stale.delete();
+                }
+            }
+            File target = new File(dir, "bg." + ext);
+            in = getContentResolver().openInputStream(source);
+            if (in == null) {
+                logLine("background: no stream for " + source);
+                return;
+            }
+            out = new java.io.FileOutputStream(target);
+            byte[] buf = new byte[1 << 16];
+            long total = 0;
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                if (n > 0) {
+                    out.write(buf, 0, n);
+                    total += n;
+                }
+            }
+            out.flush();
+            logLine("background: " + target + " (" + total + " bytes)");
+            // Re-read and repaint: the change is visible without restarting.
+            theme = LauncherTheme.load(this);
+            logLine("launcher theme: " + theme.describe());
+            setContentView(buildUiAgain());
+        } catch (Throwable t) {
+            logLine("background failed: " + t);
+        } finally {
+            try {
+                if (in != null) {
+                    in.close();
+                }
+            } catch (IOException ignored) {
+            }
+            try {
+                if (out != null) {
+                    out.close();
+                }
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
+        if (request == REQUEST_BACKGROUND) {
+            if (result == RESULT_OK) {
+                applyBackground(data);
+            } else {
+                logLine("background: cancelled");
+            }
+            return;
+        }
         if (request == REQUEST_FILE_CHOOSER) {
             Uri[] chosen = null;
             if (result == RESULT_OK && data != null) {
