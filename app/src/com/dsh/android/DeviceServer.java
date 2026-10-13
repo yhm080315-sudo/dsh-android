@@ -347,8 +347,8 @@ final class DeviceServer {
     private void dispatch(Socket socket, Request req) throws Exception {
         String path = req.path;
         try {
-            if (path.startsWith("/device/open")) {
-                handleOpen(path, socket);
+            if (path.equals("/device/open")) {
+                handleOpen(req, socket);
                 return;
             }
             if (path.equals("/") || path.equals("/device/status")) {
@@ -695,55 +695,52 @@ final class DeviceServer {
      * be refused on API 24+) and the user picks a viewer. This is what the harness'
      * open-in-app host plugin ends up calling through usr/bin/dsh-open.
      */
-    private void handleOpen(String path, Socket socket) throws Exception {
-        String raw = "";
-        int q = path.indexOf('?');
-        if (q >= 0) {
-            raw = path.substring(q + 1);
-        }
-        String filePath = null;
-        for (String pair : raw.split("&")) {
-            int eq = pair.indexOf('=');
-            if (eq <= 0) {
-                continue;
-            }
-            if (!pair.substring(0, eq).equals("path")) {
-                continue;
-            }
-            try {
-                filePath = java.net.URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
-            } catch (Exception e) {
-                filePath = null;
-            }
-        }
+    private void handleOpen(Request req, Socket socket) throws Exception {
+        String filePath = req.query.get("path");
         if (filePath == null || filePath.isEmpty()) {
             send(socket, 400, "application/json", "{\"error\":\"path required\"}".getBytes("UTF-8"));
             return;
         }
         File file = new File(filePath);
-        if (!file.isAbsolute() || !file.isFile()) {
-            send(socket, 400, "application/json", "{\"error\":\"not a regular file\"}".getBytes("UTF-8"));
+        if (!file.isAbsolute()) {
+            send(socket, 400, "application/json", "{\"error\":\"path must be absolute\"}".getBytes("UTF-8"));
+            return;
+        }
+        if (file.isDirectory()) {
+            // A folder cannot be handed to another app as a shared stream, so be
+            // explicit instead of pretending: the bridge answers, dsh-open exits
+            // non-zero, and the UI no longer reports a success that did not happen.
+            send(socket, 400, "application/json",
+                    "{\"error\":\"directory: open it with a file manager\"}".getBytes("UTF-8"));
+            return;
+        }
+        if (!file.isFile()) {
+            send(socket, 404, "application/json", "{\"error\":\"no such file\"}".getBytes("UTF-8"));
             return;
         }
         try {
             String type = new FileBridge().getType(FileBridge.uriFor(file));
-            android.content.Intent send = new android.content.Intent(android.content.Intent.ACTION_SEND);
-            send.setType(type);
-            send.putExtra(android.content.Intent.EXTRA_STREAM, FileBridge.uriFor(file));
-            send.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            android.content.Intent sendIntent = new android.content.Intent(android.content.Intent.ACTION_SEND);
+            sendIntent.setType(type);
+            sendIntent.putExtra(android.content.Intent.EXTRA_STREAM, FileBridge.uriFor(file));
+            sendIntent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
             android.content.Intent chooser =
-                    android.content.Intent.createChooser(send, "打开 " + file.getName());
+                    android.content.Intent.createChooser(sendIntent, "打开 " + file.getName());
             chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
             if (appContext == null) {
                 send(socket, 500, "application/json", "{\"error\":\"no context\"}".getBytes("UTF-8"));
                 return;
             }
             appContext.startActivity(chooser);
-            send(socket, 200, "application/json", ("{\"opened\":\"" + file.getName().replace("\"", "") + "\"}").getBytes("UTF-8"));
+            send(socket, 200, "application/json",
+                    ("{\"opened\":\"" + file.getName().replace("\"", "") + "\"}").getBytes("UTF-8"));
         } catch (Throwable t) {
-            send(socket, 500, "application/json", "{\"error\":\"could not start an activity\"}".getBytes("UTF-8"));
+            send(socket, 500, "application/json",
+                    ("{\"error\":\"could not start an activity: " + String.valueOf(t.getMessage()).replace("\"", "'") + "\"}")
+                            .getBytes("UTF-8"));
         }
     }
+
     private static void send(Socket socket, int code, String type, byte[] body) throws Exception {
         String reason = code == 200 ? "OK" : code == 400 ? "Bad Request"
                 : code == 404 ? "Not Found" : code == 501 ? "Not Implemented"

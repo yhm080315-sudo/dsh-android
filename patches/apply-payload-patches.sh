@@ -246,6 +246,21 @@ patch(
     "P15c openNativePathWithIntent 走 dsh-open",
 )
 
+# ── P16: canOpenNativePath —— 与 nativeFileManager 成对的另一半 ────────────
+# 复审者指出：可用性是 AND 条件
+#   available = fileManager !== null && canOpenPath()
+# P15 只修了前一半，后一半在 dsh-native-command:210 仍然对 android 返回 false，
+# 所以卡片依旧没有按钮。两处必须一起改。
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """	if (platform === "darwin" || platform === "win32") return true;
+	if (platform !== "linux") return false;""",
+    """	if (platform === "darwin" || platform === "win32" || platform === "android") return true; /* dsh-open-canopen */
+	if (platform !== "linux") return false;""",
+    "dsh-open-canopen",
+    "P16a canOpenNativePath 认 android",
+)
+
 # ── P5: 图片处理不依赖原生 sharp（备用路径）────────────────────────────────
 # 说明：完整的纯 JS 头部解析实现较长，这里只做「不因缺少 sharp 而整体失败」的兜底；
 # 若需要完整的图片能力，请参考 docs/PITFALLS.md 第 5 条自行补全解析器。
