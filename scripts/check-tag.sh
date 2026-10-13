@@ -64,6 +64,24 @@ else
     fail=1
 fi
 
+# e) 远端 tag 是否也指向同一个提交
+# 光检查本地不够：本项目两次栽在"发布先于推送"上 —— Release 由 API 创建时，
+# 远端 tag 会落在当时 main 的 HEAD 上，于是 tag 指向了上一个版本。
+if command -v curl >/dev/null 2>&1; then
+    remote_sha="$(curl -s --max-time 15 \
+        "https://api.github.com/repos/yhm080315-sudo/dsh-android/git/ref/tags/$TAG" \
+        | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)"
+    if [ -z "$remote_sha" ]; then
+        echo "  ? 远端 tag $TAG 读不到（未推送，或网络不通）"
+    elif [ "$remote_sha" = "$(git rev-parse HEAD)" ]; then
+        echo "  ✓ 远端 tag $TAG 指向同一个提交"
+    else
+        echo "  ✗ 远端 tag $TAG 指向 ${remote_sha:0:8}，与 HEAD 不一致"
+        echo "    修法：git push -f origin HEAD:refs/tags/$TAG"
+        fail=1
+    fi
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
     echo "校验通过。构建产物的 versionName 应当是 ${APP_VERSION}+dsh.${DSH_VERSION}，"
