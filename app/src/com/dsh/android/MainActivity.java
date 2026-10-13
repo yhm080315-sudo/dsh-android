@@ -697,19 +697,28 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logView = new TextView(this);
         logView.setTextSize(11f);
         logView.setTextColor(theme.log);
+        // Light text over glass over a photo needs its own contrast: the glass is
+        // deliberately too transparent to provide it.
+        logView.setShadowLayer(4f, 0f, 1f, 0x99000000);
         logView.setTypeface(android.graphics.Typeface.MONOSPACE);
         logView.setLineSpacing(0f, 1.15f);
         logView.setTextIsSelectable(true);
         // Same glass as the buttons: on a photo, a flat dark card is what made the
         // log look like a different app bolted onto this screen.
-        logView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x4D000000, 20f));
+        // Same family as the buttons (translucent white), not the dark card colour --
+        // "consistent with the buttons above" is exactly this: one material, not two.
+        logView.setBackground(glassSurface(0x1FFFFFFF, 20f));
         if (android.os.Build.VERSION.SDK_INT >= 21) {
             logView.setElevation(4 * getResources().getDisplayMetrics().density);
         }
         logView.setPadding(sp, sp, sp, sp);
         logView.setMovementMethod(new ScrollingMovementMethod());
         ScrollView logCard = new ScrollView(this);
-        logCard.setBackground(plate(alpha(theme.card), 12f));
+        // Transparent wrapper: the glass is painted by logView inside it. Leaving the
+        // old opaque card here is what kept the log a dark block while every other
+        // surface had already turned to glass.
+        logCard.setBackgroundColor(0x00000000);
+        logCard.setClipToPadding(false);
         logCard.addView(logView);
         logPanel.addView(logCard, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
