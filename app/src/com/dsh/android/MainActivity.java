@@ -723,8 +723,19 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logPanel.addView(logCard, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        root.addView(logPanel, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        /*
+         * Cap the content width. Everything here is in dp, so the console already
+         * scales across phone sizes and densities -- but there was no upper bound,
+         * so on a tablet or in landscape the buttons stretched across the whole
+         * width and the log lines became unreadably long. On a phone the cap is
+         * never reached and this changes nothing.
+         */
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int maxContent = (int) (640 * d);
+        FrameLayout.LayoutParams panelLp = new FrameLayout.LayoutParams(
+                Math.min(screenWidth, maxContent), ViewGroup.LayoutParams.MATCH_PARENT);
+        panelLp.gravity = android.view.Gravity.CENTER_HORIZONTAL;
+        root.addView(logPanel, panelLp);
 
         // a chip that brings the log back while the UI is on screen
         logChip = new TextView(this);
