@@ -967,6 +967,16 @@ public class NodeServer extends Service {
     private void writeAgentInstructions(File workspace) {
         File target = new File(workspace, "AGENTS.md");
         String body = ""
+                + "# 语言 / Language\n"
+                + "\n"
+                + "用用户所用的语言回答。本机用户使用中文：除非用户改用别的语言，\n"
+                + "**一律用中文**——正文、计划、提问、总结都是中文。\n"
+                + "代码、命令、文件路径、标识符、以及引用英文原文时保持原样。\n"
+                + "\n"
+                + "Reply in the language the user writes in. This device's owner works in\n"
+                + "Chinese, so answer in Chinese unless they switch. Keep code, commands,\n"
+                + "paths, identifiers and quoted English text as they are.\n"
+                + "\n"
                 + "# Android environment\n"
                 + "\n"
                 + "You are running inside the **DeepSeek Harness Android app** (com.dsh.android),\n"
