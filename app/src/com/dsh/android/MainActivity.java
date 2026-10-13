@@ -100,6 +100,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         // Device control lives in the app because screen capture and input
         // injection need signature-level permissions. Starting here (not in the
         // service) keeps it alive across WebView reloads.
+        DeviceServer.setContext(this);
         DeviceServer.startOnce(getFilesDir());
         if (new File(getFilesDir(), "root-granted").isFile()) {
             reportRoot(false);

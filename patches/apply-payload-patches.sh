@@ -37,7 +37,7 @@ def patch(rel, anchor, replacement, note, label):
         return
     with io.open(path, encoding="utf-8") as fh:
         text = fh.read()
-    if replacement[:80] in text or note in text:
+    if note in text:
         skipped.append(f"{label}（已打过）")
         return
     if anchor not in text:
@@ -190,6 +190,60 @@ patch(
 		platforms: { linux: spec(desktopCli("xdg-open")) }""",
     'id: "android"',
     "P14b 目录里加 Android 条目",
+)
+
+# ── P15: 交付卡片的「打开」在 Android 上恒不可用（真正的闸门在 native-command）──
+# 上一轮（P14）改的是 open-in-app 的应用目录 —— 那条线在链路上根本走不到。
+# 判定链实际是：
+#   dsh-native-command 的 nativeFileManager()  → 只认 darwin/win32/linux，android 返回 null
+#   dsh-api-session-controller: available = fileManager !== null && canOpenPath()
+#   dsh-client-ui-deliverables: available === false → 409
+#   dsh-client-ui-open-in-app:   if (!props.available) return null   ← 按钮直接不渲染
+# 所以必须从这里改：让 android 也是一个有原生文件动作的平台，并把动作接到
+# 载荷自带的 dsh-open（它再去调本 App 的 /device/open）。
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """	return platform === "linux" ? "directory" : null;""",
+    """	/*
+	 * Android has no desktop, but it does have a native action for this: the system
+	 * share sheet, reached through usr/bin/dsh-open, which hands the file to this app
+	 * (com.dsh.android) so it can start the chooser. Returning null here is what made
+	 * the deliverables card claim no desktop was available and render no button.
+	 */
+	if (platform === "android") return "android"; /* dsh-open-android */
+	return platform === "linux" ? "directory" : null;""",
+    "dsh-open-android",
+    "P15a nativeFileManager 认 android",
+)
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """	if (manager === "directory") {
+		await run("xdg-open", [dirname(path)], signal, "hidden");
+		return;
+	}""",
+    """	if (manager === "directory") {
+		await run("xdg-open", [dirname(path)], signal, "hidden");
+		return;
+	}
+	if (manager === "android") {
+		/* dsh-open-reveal */
+		await run("dsh-open", [path], signal, "hidden");
+		return;
+	}""",
+    "dsh-open-reveal",
+    "P15b revealNativePath 走 dsh-open",
+)
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """	const wsl = platform === "linux" && isWsl(internals);""",
+    """	const wsl = platform === "linux" && isWsl(internals);
+	if (platform === "android") {
+		/* dsh-open-open */
+		await run("dsh-open", [path], signal, "hidden");
+		return;
+	}""",
+    "dsh-open-open",
+    "P15c openNativePathWithIntent 走 dsh-open",
 )
 
 # ── P5: 图片处理不依赖原生 sharp（备用路径）────────────────────────────────

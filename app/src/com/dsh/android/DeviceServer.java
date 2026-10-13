@@ -29,6 +29,18 @@ import java.util.Map;
  */
 final class DeviceServer {
 
+    /**
+     * Application context, injected by whoever starts the server.
+     *
+     * The bridge needs it to start a chooser Activity for /device/open. The server
+     * itself is a plain object holding no Context, so this is set once at startup.
+     */
+    private static android.content.Context appContext;
+
+    static void setContext(android.content.Context context) {
+        appContext = context.getApplicationContext();
+    }
+
     private static final String TAG = "DSH";
     private static final int[] PORTS = {3090, 3091, 3092, 3093, 3094, 3095, 3096};
     private static final int MAX_BODY = 8 * 1024 * 1024;
@@ -335,6 +347,10 @@ final class DeviceServer {
     private void dispatch(Socket socket, Request req) throws Exception {
         String path = req.path;
         try {
+            if (path.startsWith("/device/open")) {
+                handleOpen(path, socket);
+                return;
+            }
             if (path.equals("/") || path.equals("/device/status")) {
                 status(socket);
             } else if (path.equals("/device/shot")) {
@@ -670,6 +686,64 @@ final class DeviceServer {
 
     // -------------------------------------------------------------------- http
 
+
+    /**
+     * Ask Android to open a file in another app.
+     *
+     * There is no desktop here, so "open in an external application" is the system
+     * share sheet: the file is handed over as a content:// URI (a file:// URI would
+     * be refused on API 24+) and the user picks a viewer. This is what the harness'
+     * open-in-app host plugin ends up calling through usr/bin/dsh-open.
+     */
+    private void handleOpen(String path, Socket socket) throws Exception {
+        String raw = "";
+        int q = path.indexOf('?');
+        if (q >= 0) {
+            raw = path.substring(q + 1);
+        }
+        String filePath = null;
+        for (String pair : raw.split("&")) {
+            int eq = pair.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            if (!pair.substring(0, eq).equals("path")) {
+                continue;
+            }
+            try {
+                filePath = java.net.URLDecoder.decode(pair.substring(eq + 1), "UTF-8");
+            } catch (Exception e) {
+                filePath = null;
+            }
+        }
+        if (filePath == null || filePath.isEmpty()) {
+            send(socket, 400, "application/json", "{\"error\":\"path required\"}".getBytes("UTF-8"));
+            return;
+        }
+        File file = new File(filePath);
+        if (!file.isAbsolute() || !file.isFile()) {
+            send(socket, 400, "application/json", "{\"error\":\"not a regular file\"}".getBytes("UTF-8"));
+            return;
+        }
+        try {
+            String type = new FileBridge().getType(FileBridge.uriFor(file));
+            android.content.Intent send = new android.content.Intent(android.content.Intent.ACTION_SEND);
+            send.setType(type);
+            send.putExtra(android.content.Intent.EXTRA_STREAM, FileBridge.uriFor(file));
+            send.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            android.content.Intent chooser =
+                    android.content.Intent.createChooser(send, "打开 " + file.getName());
+            chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            if (appContext == null) {
+                send(socket, 500, "application/json", "{\"error\":\"no context\"}".getBytes("UTF-8"));
+                return;
+            }
+            appContext.startActivity(chooser);
+            send(socket, 200, "application/json", ("{\"opened\":\"" + file.getName().replace("\"", "") + "\"}").getBytes("UTF-8"));
+        } catch (Throwable t) {
+            send(socket, 500, "application/json", "{\"error\":\"could not start an activity\"}".getBytes("UTF-8"));
+        }
+    }
     private static void send(Socket socket, int code, String type, byte[] body) throws Exception {
         String reason = code == 200 ? "OK" : code == 400 ? "Bad Request"
                 : code == 404 ? "Not Found" : code == 501 ? "Not Implemented"
