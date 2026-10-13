@@ -406,7 +406,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         private final boolean pressed;
 
         GlassDrawable(int bodyColor, float radius, float rimWidth, boolean pressed) {
-            this.bodyColor = bodyColor;
+            // Pressing lifts the whole surface, not just its highlights: the body
+            // gains white as well, which is what makes it read as "lit up".
+            this.bodyColor = pressed ? brighter(bodyColor) : bodyColor;
             this.radius = radius;
             this.rimWidth = rimWidth;
             this.pressed = pressed;
@@ -415,6 +417,15 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             shade.setStyle(android.graphics.Paint.Style.FILL);
             rim.setStyle(android.graphics.Paint.Style.STROKE);
             rim.setStrokeWidth(rimWidth);
+        }
+
+        /** Add ~14% white to a colour, keeping its alpha. */
+        private static int brighter(int color) {
+            int a = (color >>> 24) & 0xFF;
+            int r = Math.min(255, (int) (((color >> 16) & 0xFF) * 0.86f + 255 * 0.14f));
+            int g = Math.min(255, (int) (((color >> 8) & 0xFF) * 0.86f + 255 * 0.14f));
+            int b = Math.min(255, (int) ((color & 0xFF) * 0.86f + 255 * 0.14f));
+            return (a << 24) | (r << 16) | (g << 8) | b;
         }
 
         @Override
@@ -501,8 +512,8 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         // Tinted glass for the primary action, neutral glass for the rest. The body
         // is deliberately light: on a dark photo, translucent white reads as frosted.
         b.setBackground(glassSurface(primary
-                ? (alpha(theme.primary) & 0x00FFFFFF) | 0x73000000
-                : 0x3DFFFFFF, capsuleRadius()));
+                ? (alpha(theme.primary) & 0x00FFFFFF) | 0x4D000000
+                : 0x1FFFFFFF, capsuleRadius()));
         b.setPadding(0, 0, 0, 0);
         if (android.os.Build.VERSION.SDK_INT >= 21) {
             b.setElevation(6 * getResources().getDisplayMetrics().density);
@@ -563,7 +574,10 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
         logPanel = new LinearLayout(this);
         logPanel.setOrientation(LinearLayout.VERTICAL);
-        logPanel.setBackgroundColor(alpha(theme.bg));
+        // No background here. This container holds the whole console, so an opaque
+        // fill covered most of the photo *and* was the blue block visible below the
+        // log card. The photo is the background; everything on top of it is glass.
+        logPanel.setBackgroundColor(0x00000000);
         logPanel.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
@@ -591,7 +605,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         statusView = new TextView(this);
         statusView.setTextSize(13f);
         statusView.setTextColor(theme.warn);
-        statusView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x73000000, 18f));
+        statusView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x42000000, 18f));
         int sp = (int) (12 * d);
         statusView.setPadding(sp, sp, sp, sp);
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
@@ -688,7 +702,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logView.setTextIsSelectable(true);
         // Same glass as the buttons: on a photo, a flat dark card is what made the
         // log look like a different app bolted onto this screen.
-        logView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x8A000000, 20f));
+        logView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x4D000000, 20f));
         if (android.os.Build.VERSION.SDK_INT >= 21) {
             logView.setElevation(4 * getResources().getDisplayMetrics().density);
         }
