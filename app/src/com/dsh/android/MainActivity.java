@@ -70,6 +70,33 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     private WebView web;
     private boolean webAttached;
     private String pendingUrl;
+    /**
+     * Time the page gets to answer the readiness probe after a resume. Five
+     * seconds is well past a loopback load, and short enough that a blank
+     * console heals itself before the user has to do anything about it.
+     */
+    private static final long PAGE_READY_DELAY_MS = 5000;
+    /**
+     * Failures a URL is allowed before it is reported as an error rather than a
+     * retry. The page retries the flaky kinds itself -- the boot animation's
+     * media and the plugin event stream -- so one failure there is normal
+     * traffic; reporting it as a startup failure sent the P18 investigation
+     * after a bug that was not there.
+     */
+    private static final int WEB_RETRY_LIMIT = 3;
+    /**
+     * Failures per URL since the current page load started (cleared by
+     * onPageStarted). Scoped to one page load on purpose: a URL that fails once
+     * per reload is flaky and must not accumulate into a permanent verdict.
+     */
+    private final java.util.Map<String, Integer> webFailures
+            = new java.util.HashMap<String, Integer>();
+    /** URL whose client-graph handshake is in flight or already done. */
+    private String pageCheckUrl;
+    /** One self-heal reload per resume; see checkPageReady. */
+    private boolean webReloadTried;
+    /** Invalidates the readiness probe of a resume that is no longer current. */
+    private int readyCheckGeneration;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -844,6 +871,215 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     protected void onResume() {
         super.onResume();
         applyBackgroundIfNeeded();
+        /*
+         * Coming back to the foreground is a view event, not a harness event.
+         *
+         * The harness may be running, adopted, or being started right now; none
+         * of that decides whether this Activity's WebView ever navigated. It was
+         * decided by the service's callbacks alone, and when the service found a
+         * harness already running it reported nothing, so a recreated Activity
+         * kept a WebView that had never loaded anything -- a blank console until
+         * the user cleared the app. Load the view on resume, always, and let the
+         * probe below catch a page that still does not come up.
+         */
+        webReloadTried = false;
+        ensureViewLoaded("resume");
+        final int generation = ++readyCheckGeneration;
+        ui.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (generation == readyCheckGeneration) {
+                    checkPageReady();
+                }
+            }
+        }, PAGE_READY_DELAY_MS);
+    }
+
+    // ------------------------------------------------------ view loading (P20)
+
+    /**
+     * Make sure the WebView is showing the GUI, whatever the harness did.
+     *
+     * The URL is read from the service rather than waited for: a harness that is
+     * already running will not report itself again, and an Activity that only
+     * listens for that report never loads its view.
+     */
+    private void ensureViewLoaded(String trigger) {
+        if (diagnostics) {
+            return;
+        }
+        String url = NodeServer.currentUrl();
+        if (url == null) {
+            url = pendingUrl;
+        }
+        if (url == null) {
+            logLine("view load deferred: no harness url yet (" + trigger + ")");
+            return;
+        }
+        requestViewLoad(url, trigger);
+    }
+
+    /**
+     * Load `url`'s page unless this WebView is already on it.
+     *
+     * The log says which of the two happened, because "nothing to do" left no
+     * way to tell a console that was already loaded from one that never would
+     * be.
+     */
+    private void requestViewLoad(final String url, String trigger) {
+        if (diagnostics || url == null) {
+            return;
+        }
+        if (webAttached && web != null) {
+            String gui = guiPrefix(url);
+            String current = web.getUrl();
+            if (current != null && current.startsWith(gui)) {
+                logLine("view load skipped: already at " + current + " (" + trigger + ")");
+                return;
+            }
+            loadView(url, trigger);
+            return;
+        }
+        if (url.equals(pageCheckUrl)) {
+            logLine("view load pending: page handshake for " + url
+                    + " is already in flight (" + trigger + ")");
+            return;
+        }
+        pageCheckUrl = url;
+        logLine("view load scheduled: " + url + " (" + trigger + ")");
+        awaitClientGraphAndAttach(url);
+    }
+
+    /** Navigate and record it; every load should be visible in the log. */
+    private void loadView(String url, String trigger) {
+        /*
+         * The load is what the handshake guard was waiting for, so it ends here.
+         *
+         * pageCheckUrl was set when the handshake started and never cleared, so
+         * the guard that exists to stop a second handshake also stopped every
+         * later one: once the first load succeeded, each following resume matched
+         * the stale value and returned "already in flight". A recreated Activity
+         * then kept a WebView that had never navigated -- a blank console, and
+         * the more the user switched away and back, the more certain it was.
+         */
+        pageCheckUrl = null;
+        web.loadUrl(url);
+        logLine("view load performed: " + url + " (" + trigger + ")");
+    }
+
+    /**
+     * The part of `url` that identifies the app: scheme, host and port. The
+     * token lives in the query string and the client rewrites the path as the
+     * user navigates, so only this prefix can be compared.
+     */
+    private static String guiPrefix(String url) {
+        int scheme = url.indexOf("//");
+        int slash = url.indexOf('/', scheme < 0 ? 0 : scheme + 2);
+        return slash < 0 ? url : url.substring(0, slash + 1);
+    }
+
+    /**
+     * White-screen self-heal: ask the page whether it booted.
+     *
+     * A blank console after a resume is the page never having loaded, and the
+     * app had no way to notice -- it logged nothing and waited for the user to
+     * clear the app. The served document carries the boot manifest as
+     * `window.__DSH_BOOT__`; a WebView that never navigated cannot answer with
+     * it. One reload per resume, so a genuinely broken page cannot loop.
+     */
+    private void checkPageReady() {
+        if (diagnostics) {
+            return;
+        }
+        if (!webAttached || web == null) {
+            logLine("web[ready] no page attached " + (PAGE_READY_DELAY_MS / 1000)
+                    + "s after resume; view load re-checked");
+            ensureViewLoaded("ready-check");
+            return;
+        }
+        /*
+         * A page that is still fetching is not the failure this probe looks for:
+         * reloading it would restart a load that is going fine, and add back the
+         * race the handshake above exists to avoid. The page's own document says
+         * which it is -- `__DSH_BOOT__` is injected into the served HTML, so a
+         * document that finished loading without it is a blank console, while a
+         * document that reports `ready=loading` is simply not there yet.
+         */
+        try {
+            web.evaluateJavascript(
+                    "(function(){try{return (window.__DSH_BOOT__?\"boot\":\"noboot\")"
+                    + "+\" ready=\"+(document.readyState||\"?\")"
+                    + "+\" nodes=\"+(document.body?document.body.childElementCount:-1);}"
+                    + "catch(e){return \"err:\"+e;}})()",
+                    new android.webkit.ValueCallback<String>() {
+                        @Override
+                        public void onReceiveValue(String value) {
+                            onPageReadyProbe(value);
+                        }
+                    });
+        } catch (Throwable t) {
+            logLine("web[ready] probe failed: " + t);
+        }
+    }
+
+    private void onPageReadyProbe(String value) {
+        String answer = value == null ? "null" : value.replace("\"", "").replace("\\", "");
+        logLine("web[ready] probe " + answer + " at=" + stamp());
+        if (answer.startsWith("boot")) {
+            return;
+        }
+        if (webReloadTried) {
+            logLine("web[reload] the page is still blank after the reload; not retrying");
+            return;
+        }
+        if (answer.contains("ready=loading")) {
+            logLine("web[ready] the document is still loading; not reloading it");
+            return;
+        }
+        webReloadTried = true;
+        if (webAttached && web != null) {
+            web.reload();
+            logLine("web[reload] no boot manifest " + (PAGE_READY_DELAY_MS / 1000)
+                    + "s after resume; reloaded once");
+        }
+    }
+
+    /** Wall clock for a log line: `t+…ms` alone cannot be aligned across logs. */
+    private static String stamp() {
+        return new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+                .format(new java.util.Date());
+    }
+
+    // ----------------------------------------------- web failure account (P18)
+
+    /** Count this failure and return which attempt it is, since the page started. */
+    private int countFailure(String url) {
+        Integer seen = webFailures.get(url);
+        int attempt = (seen == null ? 0 : seen) + 1;
+        webFailures.put(url, attempt);
+        return attempt;
+    }
+
+    /**
+     * Resources the page keeps retrying on its own.
+     *
+     * A failed request hands the app no content type -- `onReceivedError` reports
+     * an error code, not a response -- so the endpoint has to be recognised by
+     * URL. Both patterns are the ones this app has measured failing from the
+     * reload race: the boot animation's media stream and the plugin event stream
+     * (`/plugins/events` is an EventSource, which reconnects by itself).
+     */
+    private static boolean retryableResource(String url) {
+        String lower = url.toLowerCase(java.util.Locale.US);
+        if (lower.contains("/dsh-boot-animation/media/") || lower.contains("/plugins/events")) {
+            return true;
+        }
+        int query = lower.indexOf('?');
+        String path = query < 0 ? lower : lower.substring(0, query);
+        return path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".m4v")
+                || path.endsWith(".mov") || path.endsWith(".mp3") || path.endsWith(".m4a")
+                || path.endsWith(".ogg") || path.endsWith(".wav") || path.endsWith(".aac")
+                || path.endsWith(".flac");
     }
 
     /**
@@ -854,6 +1090,14 @@ public class MainActivity extends Activity implements NodeServer.Listener {
      * until the bootstrap entry is actually present.
      */
     private void awaitClientGraphAndAttach(final String url) {
+        /*
+         * The "already in flight" guard lives in requestViewLoad, which owns
+         * pageCheckUrl. Repeating it here cancelled it out: requestViewLoad sets
+         * the field and then calls this method, so the check matched the value it
+         * had just written and the handshake never started -- the console stayed
+         * on screen with a live harness behind it and a known URL in the status
+         * bar, which looks exactly like a hang.
+         */
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -969,7 +1213,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         }
         if (webAttached) {
             if (web != null) {
-                web.loadUrl(url);
+                loadView(url, "attach");
+            } else {
+                pageCheckUrl = null;
             }
             return;
         }
@@ -987,6 +1233,19 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
         web.setWebViewClient(new WebViewClient() {
+            /**
+             * One page load, one set of failure counts.
+             *
+             * The failures this file records are almost all transient, and a
+             * URL that fails once per reload would otherwise climb past the
+             * retry limit after a few reloads and be reported as a dead
+             * resource -- a wrong verdict built out of unrelated events.
+             */
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                webFailures.clear();
+            }
+
             /*
              * The client reports "Failed to fetch" with no status, which cannot be
              * told apart from a transport failure -- and a batch of failed plugin
@@ -1006,12 +1265,38 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                  * whether it is a main-frame request and how long after the WebView
                  * attached separates "transient startup abort" from "persistent
                  * failure" -- which is the only thing missing to root-cause it.
+                 *
+                 * One failure is not a verdict (P18). The boot animation's media and
+                 * the plugin event stream are retried by the page itself, twice in a
+                 * reload in the measurements on this device, and calling each attempt
+                 * a "load-fail" pointed every investigation at a failure that healed
+                 * by itself. A URL is only reported as an error once its attempts are
+                 * spent; until then it is a retry, at info level.
                  */
+                String url = request.getUrl() == null ? "?" : request.getUrl().toString();
+                boolean main = request.isForMainFrame();
+                int attempt = countFailure(url);
                 long since = webAttachedAt == 0 ? -1 : System.currentTimeMillis() - webAttachedAt;
-                logLine("web[load-fail] main=" + request.isForMainFrame()
-                        + " t+" + since + "ms " + request.getUrl()
+                String where = "at=" + stamp() + " main=" + main + " t+" + since + "ms " + url
                         + " code=" + (error == null ? "?" : error.getErrorCode())
-                        + " " + (error == null ? "" : error.getDescription()));
+                        + " " + (error == null ? "" : error.getDescription())
+                        + " attempt " + attempt + "/" + WEB_RETRY_LIMIT;
+                if (main) {
+                    // The page itself never loaded: that is a blank console, not a retry.
+                    logLine("web[load-fail] " + where + " (main frame)");
+                } else if (retryableResource(url)) {
+                    // Retried by the page; kept out of the startup failure count.
+                    logLine("web[retry] " + where + (attempt < WEB_RETRY_LIMIT
+                            ? " (media/event stream: retried by the page)"
+                            : " (media/event stream: retries exhausted, not a startup failure)"));
+                } else if (attempt < WEB_RETRY_LIMIT) {
+                    logLine("web[retry] " + where + " (retried by the page)");
+                } else if (attempt == WEB_RETRY_LIMIT) {
+                    logLine("web[load-fail] " + where + " (retries exhausted)");
+                } else {
+                    logLine("web[retry] " + where + " (still failing; already reported at "
+                            + WEB_RETRY_LIMIT + "/" + WEB_RETRY_LIMIT + ")");
+                }
             }
         });
         /*
@@ -1070,7 +1355,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         webAttached = true;
         webAttachedAt = System.currentTimeMillis();
-        web.loadUrl(url);
+        loadView(url, "attach");
         logPanel.setVisibility(View.GONE);
         if (logChip != null) {
             logChip.setVisibility(View.VISIBLE);
@@ -1108,8 +1393,12 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             @Override
             public void run() {
                 if (pendingUrl != null) {
-                    attachWeb(pendingUrl);
+                    String url = pendingUrl;
                     pendingUrl = null;
+                    // Through the same door as every other load: the client graph
+                    // has to exist before the page is shown, or the shell reports
+                    // "HTML did not preload …/client.js" instead of the console.
+                    requestViewLoad(url, "service log");
                 }
                 logView.append(line + "\n");
                 int scroll = logView.getLayout() == null ? 0
@@ -1129,10 +1418,11 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             public void run() {
                 statusView.setText("已就绪：" + url);
                 statusView.setTextColor(theme.ok);
+                // The service reports the endpoint on a worker thread; the view is
+                // this Activity's own business, so the load is driven from here.
+                requestViewLoad(url, "service ready");
             }
         });
-        // Only hand the page to the WebView once its client plugin graph exists.
-        awaitClientGraphAndAttach(url);
     }
 
     @Override
@@ -1391,6 +1681,25 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
     @Override
     protected void onDestroy() {
+        // A probe queued for this resume must not touch a torn-down WebView.
+        readyCheckGeneration++;
+        /*
+         * Destroy the WebView with the Activity.
+         *
+         * An explicitly started Activity ("am start -n") can pile up instances,
+         * each holding its own WebView and its renderer; after five or six of them
+         * the console degenerated into an empty session -- a white screen. Reusing
+         * the instance (launchMode=singleTask) is the cure; this makes the leak
+         * survivable if an instance is ever torn down again.
+         */
+        if (web != null) {
+            try {
+                web.destroy();
+            } catch (Throwable ignored) {
+            }
+            web = null;
+            webAttached = false;
+        }
         NodeServer.removeListener(this);
         super.onDestroy();
     }

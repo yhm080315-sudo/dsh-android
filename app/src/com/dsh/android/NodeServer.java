@@ -35,6 +35,17 @@ import java.util.zip.GZIPInputStream;
  */
 public class NodeServer extends Service {
 
+    /**
+     * Set only when the user or the app actually asked for a stop.
+     *
+     * The exit code cannot answer "should this come back?": the app stops the
+     * harness with SIGTERM, which the harness reports as a clean exit 0 -- exactly
+     * like a runtime that finished its work. Treating 0 as success is why the
+     * console sat on an exited runtime every time a system panel (the share sheet,
+     * for one) took the foreground and the service was torn down.
+     */
+    private volatile boolean stopRequested = false;
+
     private static final String TAG = "DSH";
     private static final String CHANNEL_ID = "dsh-runner";
     private static final int NOTIFICATION_ID = 1001;
@@ -59,10 +70,41 @@ public class NodeServer extends Service {
     private Process process;
     private Thread pump;
     private Thread worker;
-    private int port = 3220;
+    private int port = PORT_START;
     private int restarts;
     private static final int MAX_RESTARTS = 3;
     private static final String[] ASSET_PROBES = {"probes/tsys.bin"};
+
+    /**
+     * Ports the harness is started on: 3220 upward, the band freePort(PORT_START)
+     * hands out first. The band bounds where a harness left by a previous app
+     * process can be looked for; a harness found elsewhere is still adopted, but
+     * only through the process itself (see runningHarnesses).
+     */
+    private static final int PORT_START = 3220;
+    private static final int PORT_PROBE_SPAN = 10;
+
+    /** A loopback HTTP answer takes milliseconds; these only bound a stuck peer. */
+    private static final int PROBE_CONNECT_MS = 500;
+    private static final int PROBE_READ_MS = 1500;
+
+    /** What a live harness answers to a request that carries no session token. */
+    private static final String HARNESS_UNAUTH = "dsh web authentication required";
+
+    /**
+     * An adopted harness is not this app's child: nothing can wait() for it, and
+     * this instance is the only thing that knows it should still be there.
+     */
+    private volatile int adoptedPid = -1;
+
+    /**
+     * Set when this service instance is torn down without the app asking for a stop.
+     *
+     * The harness is left running in that case, so this instance's threads have to
+     * fall silent instead of supervising a runtime that now belongs to the next
+     * service instance -- a second supervisor would start a second harness.
+     */
+    private volatile boolean retired = false;
 
     public static boolean isRunning() {
         return sRunning;
@@ -112,6 +154,7 @@ public class NodeServer extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? ACTION_START : intent.getAction();
         if (ACTION_STOP.equals(action)) {
+            stopRequested = true;
             stopEverything();
             stopSelf();
             return START_NOT_STICKY;
@@ -145,8 +188,43 @@ public class NodeServer extends Service {
 
     @Override
     public void onDestroy() {
-        stopEverything();
+        /*
+         * A stop the app asked for takes the runtime with it; a teardown it did not
+         * ask for does not.
+         *
+         * A service instance can be destroyed while its harness is mid-task -- the
+         * system stopping a background service is the usual way -- and SIGTERMing
+         * the harness there interrupts work in flight and leaves the next instance
+         * to start a second harness on the same session logs. The harness is left
+         * running instead, and the next instance either adopts it (pid unchanged,
+         * task intact) or, if it is no longer serving, clears it.
+         */
+        if (stopRequested || !somethingRunning()) {
+            stopEverything();
+        } else {
+            retired = true;
+            logLine("service instance is going away; the harness keeps running for the next one");
+        }
         super.onDestroy();
+    }
+
+    /**
+     * True when this instance still has a harness at work.
+     *
+     * Either its own child, or one it adopted -- an adopted harness is invisible to
+     * `exitValue()`, so it is recognised by its /proc entry, the same way it was found.
+     */
+    private boolean somethingRunning() {
+        if (stillRunning(process)) {
+            return true;
+        }
+        int pid = adoptedPid;
+        if (pid <= 0) {
+            return false;
+        }
+        Harness h = new Harness(pid, port);
+        h.token = sToken;
+        return stillTheHarness(h);
     }
 
     private void stopEverything() {
@@ -154,7 +232,33 @@ public class NodeServer extends Service {
             process.destroy();
             process = null;
         }
+        stopAdoptedHarness();
         sRunning = false;
+    }
+
+    /**
+     * Stop a harness this instance adopted rather than started.
+     *
+     * `process.destroy()` cannot reach it, so without this an explicit stop would
+     * leave the runtime serving with nothing left to stop it -- and the next app
+     * start would adopt it again as if the stop never happened.
+     */
+    private void stopAdoptedHarness() {
+        int pid = adoptedPid;
+        if (pid <= 0) {
+            return;
+        }
+        adoptedPid = -1;
+        Harness h = new Harness(pid, port);
+        h.token = sToken;
+        if (!stillTheHarness(h)) {
+            return;
+        }
+        logLine("stopping the adopted harness (pid " + pid + ") because the app asked for a stop");
+        android.os.Process.sendSignal(pid, 15);
+        if (!awaitGone(pid, 3000)) {
+            android.os.Process.sendSignal(pid, 9);
+        }
     }
 
     // ---------------------------------------------------------------- runtime
@@ -609,6 +713,16 @@ public class NodeServer extends Service {
     /** Profile rows the app turns off: HMR cannot run without --expose-internals. */
     private static final String[] DISABLED_ROWS = {"hmr"};
 
+    /**
+     * Plugins shipped inside the APK. Their tarballs live in assets/plugins and the
+     * app installs them into the profile on every start (see installBundledPlugins),
+     * because the device has no package manager: a plugin can only arrive bundled
+     * with the app or dropped into /sdcard/DSH/plugins by hand.
+     */
+    private static final String[][] BUNDLED_ROWS = {
+            {"screen-operate", "dsh-screen-operate"},
+    };
+
     private static final String[][] CLIENT_ROWS = {
             {"dsh-web-mobile", "dsh-web-mobile"},
             {"ui-skin-whale-fantasy-18", "dsh-skin-whale-fantasy"},
@@ -630,6 +744,20 @@ public class NodeServer extends Service {
             }
 
             StringBuilder rows = new StringBuilder();
+            // Same shape as the client rows below: the profile patch dialect wants the
+            // "- insert:" wrapper, and a row whose package is not resolvable from the
+            // profile must be skipped rather than written as a broken entry.
+            for (String[] row : BUNDLED_ROWS) {
+                if (existing.contains(row[1])) {
+                    continue;
+                }
+                if (!new File(modules, row[1]).isDirectory()) {
+                    logLine("bundled plugin not resolvable from the profile, skipping: " + row[1]);
+                    continue;
+                }
+                rows.append("- insert:\n    - id: ").append(row[0])
+                        .append("\n      name: '").append(row[1]).append("'\n");
+            }
             for (String[] row : CLIENT_ROWS) {
                 if (existing.contains(row[1])) {
                     continue;
@@ -965,7 +1093,6 @@ public class NodeServer extends Service {
      * that shared storage is reachable, and how to obtain root.
      */
     private void writeAgentInstructions(File workspace) {
-        File target = new File(workspace, "AGENTS.md");
         String body = ""
                 + "# 语言 / Language\n"
                 + "\n"
@@ -1027,7 +1154,29 @@ public class NodeServer extends Service {
                 + "  values and injects only its own registry, so `$DSH_DEVICE_TOKEN` expands to\n"
                 + "  nothing. Easiest client is `dshdev` (tools/dshdev.js).\n"
                 + "- Most endpoints act through `su`, so they need root to have been granted.\n";
+        /*
+         * Two copies, deliberately.
+         *
+         * The workspace one is what the harness calls a nested instruction file: it is
+         * only projected into a session once a file tool has touched a path inside that
+         * project. The baseline, which loads before the first request, comes from the
+         * session's cwd -- and a new session's cwd is /storage/emulated/0, where there
+         * is no AGENTS.md and no project root marker. So a new session used to start
+         * with no instructions at all: English answers, no screen tools, guessing at
+         * the environment. The user-level copy under $HOME/.dsh is cwd-independent.
+         */
+        writeInstructions(new File(new File(homeDir(), ".dsh"), "AGENTS.md"), body);
+        writeInstructions(new File(workspace, "AGENTS.md"), body);
+    }
+
+    /** Write the instructions if they changed; log the path either way. */
+    private void writeInstructions(File target, String body) {
         try {
+            File parent = target.getParentFile();
+            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                logLine("cannot create " + parent.getAbsolutePath());
+                return;
+            }
             if (target.isFile()) {
                 byte[] existing = new byte[(int) target.length()];
                 java.io.FileInputStream in = new java.io.FileInputStream(target);
@@ -1042,7 +1191,7 @@ public class NodeServer extends Service {
             out.close();
             logLine("wrote agent instructions: " + target.getAbsolutePath());
         } catch (Throwable t) {
-            logLine("agent instructions failed: " + t);
+            logLine("agent instructions failed for " + target.getAbsolutePath() + ": " + t);
         }
     }
 
@@ -1077,13 +1226,648 @@ public class NodeServer extends Service {
         }
     }
 
+    // ------------------------------------------------------- the running harness
+
+    /** One of this app's harness processes, as found in /proc. */
+    private static final class Harness {
+        final int pid;
+        final int port;
+        /** The session token that opens it, once one has been shown to work. */
+        String token;
+        /** Why it is being cleared, filled in for the ones that cannot be reused. */
+        String why;
+
+        Harness(int pid, int port) {
+            this.pid = pid;
+            this.port = port;
+        }
+    }
+
+    /** What the scan before a launch found: the harness to reuse, and the leftovers. */
+    private static final class HarnessSweep {
+        Harness adopted;
+        final List<Harness> stale = new ArrayList<Harness>();
+    }
+
+    /** The pieces of an HTTP answer that tell one loopback server from another. */
+    private static final class Reply {
+        int status = -1;
+        String body = "";
+
+        boolean isHarness() {
+            return status == 401 && body.contains(HARNESS_UNAUTH);
+        }
+    }
+
+    /**
+     * Every harness of ours that is still running, with the port it claims.
+     *
+     * Read from /proc rather than trusted from the port band: the `--port N` in a
+     * process's own cmdline is what says which port that process was started with,
+     * so a port that is busy for some other reason can never be mistaken for our
+     * harness. Only processes whose /proc entry we can read are considered, which in
+     * practice means our own uid -- another app's harness is invisible and stays
+     * untouched.
+     */
+    private List<Harness> runningHarnesses() {
+        List<Harness> found = new ArrayList<Harness>();
+        File[] entries = new File("/proc").listFiles();
+        if (entries == null) {
+            return found;
+        }
+        String marker = dshEntry().getAbsolutePath();
+        int mine = android.os.Process.myPid();
+        String ourUid = "Uid:\t" + android.os.Process.myUid();
+        for (File entry : entries) {
+            String name = entry.getName();
+            if (!entry.isDirectory() || !name.matches("[0-9]+")) {
+                continue;
+            }
+            int pid;
+            try {
+                pid = Integer.parseInt(name);
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (pid == mine) {
+                continue;
+            }
+            String cmd = readProc(entry, "cmdline");
+            if (cmd.isEmpty() || !cmd.contains(marker)) {
+                continue;
+            }
+            if (!readProc(entry, "status").contains(ourUid)) {
+                continue;
+            }
+            int p = portFromCmdline(cmd);
+            if (p <= 0) {
+                logLine("harness pid " + pid + " carries no --port argument; it cannot be reused");
+                continue;
+            }
+            logLine("found a running harness of ours: pid " + pid + " on port " + p);
+            found.add(new Harness(pid, p));
+        }
+        return found;
+    }
+
+    /** The value after `--port ` in a cmdline read from /proc, or -1. */
+    private static int portFromCmdline(String cmd) {
+        String flag = "--port ";
+        int at = cmd.indexOf(flag);
+        if (at < 0) {
+            return -1;
+        }
+        int i = at + flag.length();
+        int end = i;
+        while (end < cmd.length() && Character.isDigit(cmd.charAt(end))) {
+            end++;
+        }
+        if (end == i) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(cmd.substring(i, end));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * One HTTP/1.1 GET on loopback, without following anything.
+     *
+     * A listening socket proves nothing: a stopped or wedged harness still holds its
+     * socket, and any other process on the phone may own the port. An *answer* proves
+     * something, and the harness's answers are its own -- `GET /` without a session
+     * token gets 401 "dsh web authentication required", and the same request with the
+     * token that process was started with gets its 303 cookie exchange. Liveness and
+     * identity are both decided from that, with no other app involved.
+     *
+     * @returns null when nothing answered at all.
+     */
+    private static Reply httpGet(int p, String path) {
+        java.net.Socket socket = new java.net.Socket();
+        try {
+            socket.connect(new java.net.InetSocketAddress("127.0.0.1", p), PROBE_CONNECT_MS);
+            socket.setSoTimeout(PROBE_READ_MS);
+            OutputStream out = socket.getOutputStream();
+            out.write(("GET " + path + " HTTP/1.1\r\n"
+                    + "Host: 127.0.0.1:" + p + "\r\n"
+                    + "Accept: */*\r\n"
+                    + "Connection: close\r\n\r\n").getBytes("UTF-8"));
+            out.flush();
+            byte[] buf = new byte[4096];
+            int total = 0;
+            InputStream in = socket.getInputStream();
+            int n;
+            while (total < buf.length && (n = in.read(buf, total, buf.length - total)) > 0) {
+                total += n;
+            }
+            String raw = new String(buf, 0, total, "UTF-8");
+            Reply reply = new Reply();
+            if (raw.startsWith("HTTP/")) {
+                int sp = raw.indexOf(' ');
+                if (sp > 0 && sp + 4 <= raw.length()) {
+                    try {
+                        reply.status = Integer.parseInt(raw.substring(sp + 1, sp + 4));
+                    } catch (NumberFormatException notAStatus) {
+                        reply.status = -1;
+                    }
+                }
+                int at = raw.indexOf("\r\n\r\n");
+                reply.body = at < 0 ? "" : raw.substring(at + 4);
+            }
+            return reply;
+        } catch (Throwable nothingAnswered) {
+            return null;
+        } finally {
+            try {
+                socket.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * Decide, before anything is started or killed, whether a harness is already
+     * serving this app.
+     *
+     * Alive and usable are different questions, and only the second one may decide a
+     * reuse. Reusing means handing the WebView the URL the harness printed when it
+     * started -- `http://127.0.0.1:PORT/?token=...` -- and that token lives in the
+     * process that printed it plus the copy `web.token` keeps. So a candidate is
+     * adopted only when a request carrying that token is answered with the harness's
+     * 303 exchange, which is the same proof a browser gets. Everything else is a
+     * leftover: a harness from before an upgrade whose token died with the old app
+     * process, a process that no longer answers, or a foreign listener on the port.
+     *
+     * Installs a new APK and the harness is still working? That is exactly the case
+     * this exists for -- the session keeps its single writer, and the turn that was
+     * in flight when the app process died keeps running.
+     */
+    private HarnessSweep sweepHarnesses() {
+        HarnessSweep sweep = new HarnessSweep();
+        List<Harness> live = runningHarnesses();
+        if (live.isEmpty()) {
+            logLine("no harness of ours is running; a fresh one will be started");
+            reportPortBand();
+            return sweep;
+        }
+        int preferred = rememberedPort();
+        for (int i = 0; i < live.size(); i++) {
+            if (live.get(i).port == preferred) {
+                live.add(0, live.remove(i));
+                break;
+            }
+        }
+        String token = rememberedToken();
+        for (Harness h : live) {
+            String candidate = token;
+            if (candidate == null || !tokenOpens(h.port, candidate)) {
+                String recovered = tokenFromLog(h.port);
+                if (recovered != null && !recovered.equals(candidate) && tokenOpens(h.port, recovered)) {
+                    logLine("recovered the session token of pid " + h.pid
+                            + " from a rotated dsh.log; it was started by an earlier app build");
+                    candidate = recovered;
+                }
+            }
+            if (candidate != null && tokenOpens(h.port, candidate)) {
+                h.token = candidate;
+                sweep.adopted = h;
+                break;
+            }
+        }
+        for (Harness h : live) {
+            if (h == sweep.adopted) {
+                continue;
+            }
+            h.why = sweep.adopted == null
+                    ? refusal(h)
+                    : "a second harness of ours on port " + h.port
+                            + ", which would write the same session logs twice";
+            sweep.stale.add(h);
+        }
+        return sweep;
+    }
+
+    /** True when `token` is that process's token: the harness answers with its 303. */
+    private boolean tokenOpens(int p, String token) {
+        Reply reply = httpGet(p, "/?token=" + token);
+        return reply != null && reply.status == 303;
+    }
+
+    /**
+     * Why a live harness on this port cannot be reused, in one clause for the log.
+     *
+     * Retried, because "does not answer" and "did not answer this instant" are not the
+     * same claim and the difference is a runtime: an LLM turn does not block the event
+     * loop, but a synchronous burst does, and a single timed-out request must never be
+     * the evidence that gets a working process killed. What the process is doing while
+     * it stays silent separates the two diagnoses.
+     */
+    private String refusal(Harness h) {
+        Reply reply = null;
+        for (int attempt = 0; attempt < 3 && reply == null; attempt++) {
+            if (attempt > 0) {
+                sleepQuietly(700);
+            }
+            reply = httpGet(h.port, "/");
+        }
+        if (reply == null) {
+            boolean busy = cpuBusy(h.pid);
+            return "a stale harness that is not serving (pid " + h.pid + " is alive "
+                    + (busy ? "and still burning CPU" : "but silent") + " on port " + h.port + ")";
+        }
+        if (reply.isHarness()) {
+            return "a leftover harness that cannot be reused (no session token for it on disk)";
+        }
+        return "a process on port " + h.port + " that does not answer as this app's harness (status "
+                + reply.status + ")";
+    }
+
+    /**
+     * What the port band answers when no harness of ours was found.
+     *
+     * A port in the band can be held by something that is not ours, and then the only
+     * thing that matters is knowing it: the new harness gets a different port and the
+     * log says why. Nothing here can decide an adoption -- that requires a process of
+     * ours, checked in /proc.
+     */
+    private void reportPortBand() {
+        for (int p = PORT_START; p < PORT_START + PORT_PROBE_SPAN; p++) {
+            Reply reply = httpGet(p, "/");
+            if (reply == null) {
+                continue;
+            }
+            logLine("port " + p + " answers (status " + reply.status + ")"
+                    + (reply.isHarness() ? " as a harness that is not one of our processes" : ""));
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * True when a process is burning CPU right now, sampled from its own /proc entry.
+     *
+     * Only ever used to keep the log honest: "alive but silent" and "alive, working,
+     * and silent" are different diagnoses, and a runtime stuck in a synchronous burst
+     * looks dead from the outside for exactly as long as the burst lasts.
+     */
+    private static boolean cpuBusy(int pid) {
+        long before = cpuTicks(pid);
+        sleepQuietly(500);
+        long after = cpuTicks(pid);
+        return before >= 0 && after > before;
+    }
+
+    /** utime + stime from /proc/<pid>/stat, or -1 when it cannot be read. */
+    private static long cpuTicks(int pid) {
+        String stat = readProc(new File("/proc/" + pid), "stat");
+        int close = stat.lastIndexOf(')'); // comm may contain spaces and parentheses
+        if (close < 0) {
+            return -1;
+        }
+        String[] fields = stat.substring(close + 1).trim().split("\\s+");
+        // After the comm field comes state(3)..cmajflt(13), then utime(14) and stime(15).
+        if (fields.length < 13) {
+            return -1;
+        }
+        try {
+            return Long.parseLong(fields[11]) + Long.parseLong(fields[12]);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * Clear the harnesses that could not be adopted.
+     *
+     * Every signal is announced with the reason it is being sent, because the harness
+     * only reports the symptom ("SIGTERM received -> shutting down (exit 0)") and the
+     * app used to report nothing at all: a task died with a clean exit code and no
+     * line anywhere saying who ended it or why.
+     *
+     * The wait matters as much as the signal. A harness signalled a moment before the
+     * new one starts may still be flushing a session log, and two writers on one log
+     * is the corruption this whole path exists to prevent -- so the tree has to be
+     * clear before anything new is started.
+     */
+    private void purgeStaleHarnesses(List<Harness> stale) throws IOException {
+        for (Harness h : stale) {
+            if (!new File("/proc/" + h.pid).isDirectory()) {
+                continue;
+            }
+            logLine("killing " + h.why + " (pid " + h.pid + ")");
+            android.os.Process.sendSignal(h.pid, 15);
+            if (awaitGone(h.pid, 3000)) {
+                continue;
+            }
+            logLine("pid " + h.pid + " ignored SIGTERM; sending SIGKILL");
+            android.os.Process.sendSignal(h.pid, 9);
+            if (!awaitGone(h.pid, 3000)) {
+                throw new IOException("harness pid " + h.pid + " survived SIGKILL; refusing to"
+                        + " start a second harness that would write the same session logs");
+            }
+        }
+    }
+
+    /** Wait for a process to leave /proc; a zombie has an empty cmdline and is gone. */
+    private static boolean awaitGone(int pid, long millis) {
+        File dir = new File("/proc/" + pid);
+        long deadline = System.currentTimeMillis() + millis;
+        while (true) {
+            if (!dir.isDirectory() || readProc(dir, "cmdline").isEmpty()) {
+                return true;
+            }
+            if (System.currentTimeMillis() >= deadline) {
+                return false;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+    }
+
+    /**
+     * True while that harness is still there.
+     *
+     * Two signals, either is enough: /proc still describes that process on that port,
+     * or the port still answers with that process's own token exchange. Deliberately
+     * generous, because "not there" is the expensive verdict -- it starts a second
+     * harness, and a second writer on one session log is worse than a late restart.
+     * The token exchange cannot be faked by another process: it is per-process random.
+     */
+    private boolean stillTheHarness(Harness h) {
+        String cmd = readProc(new File("/proc/" + h.pid), "cmdline");
+        if (cmd.contains(dshEntry().getAbsolutePath()) && cmd.contains("--port " + h.port)) {
+            return true;
+        }
+        return h.token != null && tokenOpens(h.port, h.token);
+    }
+
+    /**
+     * Continue with the harness that is already running.
+     *
+     * Nothing is killed and nothing is started: the process keeps serving, the session
+     * keeps one writer, and the work that was in flight when the previous app process
+     * was killed is still in flight. The only thing this instance has to add is the
+     * URL the WebView needs, rebuilt from the port and token on disk.
+     */
+    private void adoptHarness(final Harness h) {
+        port = h.port;
+        adoptedPid = h.pid;
+        sToken = h.token;
+        sUrl = "http://127.0.0.1:" + h.port + "/?token=" + h.token;
+        sRunning = true;
+        rememberWebEndpoint(h.port, h.token);
+        logLine("adopted the running harness on port " + h.port + " (pid " + h.pid + ")");
+        postNotification("dsh is running", "adopted pid " + h.pid + " on port " + h.port);
+        for (Listener l : LISTENERS) {
+            l.onReady(sUrl, sToken);
+        }
+        superviseAdopted(h);
+    }
+
+    /**
+     * An adopted harness is not this app's child, so `waitFor()` will never report its
+     * death, and a runtime that dies unwatched would leave the console on a page that
+     * cannot recover. Poll its identity instead (see stillTheHarness) and start a fresh
+     * one only once it is really gone.
+     */
+    private void superviseAdopted(final Harness h) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (!stopRequested && !retired) {
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (stopRequested || retired) {
+                        return;
+                    }
+                    if (stillTheHarness(h)) {
+                        continue;
+                    }
+                    sRunning = false;
+                    adoptedPid = -1;
+                    logLine("the adopted harness (pid " + h.pid + ", port " + h.port
+                            + ") is gone; starting a fresh one");
+                    try {
+                        launch();
+                    } catch (Throwable failed) {
+                        logLine("restart after the adopted harness failed: " + failed);
+                        stopSelf();
+                    }
+                    return;
+                }
+            }
+        }, "dsh-adopted");
+        t.start();
+    }
+
+    // ------------------------------------------------------------ web endpoint
+
+    /**
+     * Where the last harness was reachable, for the next app process.
+     *
+     * The harness prints its URL -- port plus a per-process random token -- once, on
+     * stdout, and keeps the token in memory only: a new app process cannot ask the
+     * running process for it, so without a copy on disk a harness can be proven alive
+     * and still be unusable. These two files are that copy. They sit in the app's
+     * private home, never on shared storage: they are credentials.
+     */
+    private File webPortFile() {
+        return new File(homeDir(), "web.port");
+    }
+
+    private File webTokenFile() {
+        return new File(homeDir(), "web.token");
+    }
+
+    private void rememberWebEndpoint(int p, String token) {
+        try {
+            if (!homeDir().mkdirs() && !homeDir().isDirectory()) {
+                logLine("cannot create " + homeDir().getAbsolutePath());
+                return;
+            }
+            writeFile(webPortFile(), p + "\n");
+            writeFile(webTokenFile(), token + "\n");
+            chmod600(webPortFile());
+            chmod600(webTokenFile());
+            logLine("remembered the web endpoint: port " + p + ", token " + token.length() + " chars");
+        } catch (Throwable t) {
+            logLine("cannot remember the web endpoint: " + t);
+        }
+    }
+
+    /** Drop a description of a harness that is gone, so nothing adopts its ghost. */
+    private void forgetWebEndpoint() {
+        for (File f : new File[]{webPortFile(), webTokenFile()}) {
+            if (f.isFile() && !f.delete()) {
+                logLine("cannot remove " + f.getAbsolutePath());
+            }
+        }
+    }
+
+    private int rememberedPort() {
+        try {
+            int p = Integer.parseInt(readFile(webPortFile()).trim());
+            return p > 0 && p < 65536 ? p : -1;
+        } catch (NumberFormatException notANumber) {
+            return -1;
+        }
+    }
+
+    private String rememberedToken() {
+        String s = readFile(webTokenFile()).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    private static void chmod600(File f) {
+        try {
+            new ProcessBuilder("/system/bin/chmod", "600", f.getAbsolutePath())
+                    .redirectErrorStream(true).start();
+        } catch (Throwable ignored) {
+            // already inside app-private storage; the mode is belt and braces
+        }
+    }
+
+    /**
+     * The token of a harness that outlived the app process that started it.
+     *
+     * The banner `dsh web: http://127.0.0.1:PORT/?token=...` is written into the log
+     * as it arrives, so the rotated copies are the only remaining description of a
+     * token whose process is still doing useful work -- the one case where clearing
+     * the harness would interrupt a task for no reason. The recovered token is not
+     * trusted on its own: the caller still has to get that process's 303 with it.
+     */
+    private String tokenFromLog(int p) {
+        File dir = getFilesDir();
+        String found = tokenInLog(new File(dir, "dsh.log"), p);
+        for (int i = 1; found == null && i <= DiagnosticServer.LOG_GENERATIONS; i++) {
+            found = tokenInLog(new File(dir, "dsh.log." + i), p);
+        }
+        return found;
+    }
+
+    /** The last token for that port in one log file, or null. */
+    private static String tokenInLog(File f, int p) {
+        if (!f.isFile() || f.length() > (1 << 20)) {
+            return null;
+        }
+        String text = readFile(f);
+        String needle = "http://127.0.0.1:" + p + "/?token=";
+        String found = null;
+        int at = text.indexOf(needle);
+        while (at >= 0) {
+            int i = at + needle.length();
+            int end = i;
+            while (end < text.length() && tokenChar(text.charAt(end))) {
+                end++;
+            }
+            if (end > i) {
+                found = text.substring(i, end);
+            }
+            at = text.indexOf(needle, at + 1);
+        }
+        return found;
+    }
+
+    /** The alphabet of the harness's launch token (base64url). */
+    private static boolean tokenChar(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == '-' || c == '_';
+    }
+
+    /** First bytes of a /proc entry, or "" when it cannot be read. */
+    private static String readProc(File dir, String name) {
+        try {
+            java.io.FileInputStream in = new java.io.FileInputStream(new File(dir, name));
+            byte[] buf = new byte[512];
+            int n = in.read(buf);
+            in.close();
+            return n > 0 ? new String(buf, 0, n, "UTF-8").replace('\0', ' ') : "";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     private void launch() throws IOException {
         File node = new File(binDir(), "node");
         if (!node.isFile()) {
             throw new IOException("node binary missing at " + node);
         }
 
-        port = freePort(3220);
+        /*
+         * The harness this instance is already working with: leave the world alone.
+         *
+         * Every Activity start sends ACTION_START, so this method runs again whenever
+         * the Activity is recreated -- on the way back from the background, on a
+         * WebView reload, on a theme change. What it would find is the child this
+         * service is supervising (replacing it kills the work in flight) or a harness
+         * this same instance already adopted (adopting it twice would put two
+         * watchdogs on one process, and each would start a harness when it dies).
+         */
+        if (somethingRunning()) {
+            /*
+             * Leaving the harness alone is not the same as doing nothing (P20).
+             *
+             * Every Activity start lands here once a harness exists, and the
+             * Activity that asked is usually a new one with an empty WebView and
+             * no URL of its own. This branch used to return in silence, so that
+             * WebView was never navigated: the console came back to the
+             * foreground blank, and only clearing the app fixed it. The harness
+             * is still untouched -- the recorded URL is simply handed back, the
+             * same way the adoption path hands it back, and the Activity decides
+             * whether the page needs loading (it skips the load when the view is
+             * already on it).
+             */
+            sRunning = true;
+            if (sUrl != null) {
+                logLine("harness already running on port " + port
+                        + "; harness restart skipped, the view load is the Activity's");
+                for (Listener l : LISTENERS) {
+                    l.onReady(sUrl, sToken);
+                }
+            } else {
+                logLine("this instance's harness is still running on port " + port
+                        + "; nothing to do (no url recorded yet)");
+            }
+            return;
+        }
+
+        /*
+         * Reuse before cleanup: being first is what broke a running task.
+         *
+         * The harness is a separate node process, it survives the app process being
+         * killed, and the next app instance used to SIGTERM it as "stale" -- in the
+         * middle of a turn, which the harness reports as a clean exit 0. What has to
+         * be established first is which processes of ours are running, which one is
+         * actually serving, and whether this instance can authenticate to it. Only
+         * the leftovers are cleared.
+         */
+        HarnessSweep sweep = sweepHarnesses();
+        if (sweep.adopted != null) {
+            adoptHarness(sweep.adopted);
+            purgeStaleHarnesses(sweep.stale);
+            return;
+        }
+        purgeStaleHarnesses(sweep.stale);
+        // The files describe a harness that just went away; the new one rewrites them.
+        forgetWebEndpoint();
+
+        port = freePort(PORT_START);
         List<String> cmd = new ArrayList<String>();
         cmd.add(node.getAbsolutePath());
         cmd.add(dshEntry().getAbsolutePath());
@@ -1091,6 +1875,23 @@ public class NodeServer extends Service {
         cmd.add("--port");
         cmd.add(String.valueOf(port));
         cmd.add("--no-open");
+
+        /*
+         * Put the harness in its own session (setsid).
+         *
+         * Without it the harness shares a process group with whatever the agent
+         * runs -- and a group-directed signal, which a root shell or su can emit,
+         * then takes the harness down with the command. That is exactly how a test
+         * command killed the runtime with SIGINT (exit 130, no crash, no error).
+         * Starting it in its own session makes the runtime immune to that.
+         */
+        File sessionTool = new File(binDir(), "busybox");
+        if (sessionTool.isFile()) {
+            cmd.add(0, "setsid");
+            cmd.add(0, sessionTool.getAbsolutePath());
+        } else {
+            logLine("warning: no busybox for setsid; the runtime shares this process group");
+        }
 
         ProcessBuilder pb = new ProcessBuilder(cmd);
         // HOME must be the same directory the state helpers above use. Pointing the
@@ -1157,14 +1958,30 @@ public class NodeServer extends Service {
                 }
                 sRunning = false;
                 long lived = System.currentTimeMillis() - startedAt;
+                if (retired) {
+                    // This instance was torn down without a stop request, so its threads
+                    // have to fall silent: the successor owns the runtime now, and two
+                    // restarters would start two harnesses on one set of session logs.
+                    logLine("harness exited (" + exitReason(code) + ") after " + (lived / 1000)
+                            + "s; this service instance is retired, the running one decides");
+                    return;
+                }
                 for (Listener l : LISTENERS) {
                     l.onExit(code);
                 }
-                // A harness that dies straight away is broken, not unlucky; only
-                // retry when it had run for a while, and only a few times.
-                if (code != 0 && lived > 10000 && restarts < MAX_RESTARTS) {
+                /*
+                 * Bring it back whenever it was not stopped on purpose.
+                 *
+                 * The exit code is not the question: 0 here means "someone signalled
+                 * it" (the app stops the harness with SIGTERM, which the harness
+                 * reports as a clean exit), not "the work is done". A runtime that is
+                 * supposed to be running and is not has to come back. A harness that
+                 * dies straight away is broken, not unlucky, so the uptime floor and
+                 * the retry cap still apply.
+                 */
+                if (!stopRequested && lived > 10000 && restarts < MAX_RESTARTS) {
                     restarts++;
-                    logLine("harness exited (code " + code + ") after " + (lived / 1000)
+                    logLine("harness exited (" + exitReason(code) + ") after " + (lived / 1000)
                             + "s; restart " + restarts + "/" + MAX_RESTARTS);
                     try {
                         Thread.sleep(3000);
@@ -1181,7 +1998,7 @@ public class NodeServer extends Service {
                     }
                     return;
                 }
-                logLine("harness exited (code " + code + ") after " + (lived / 1000)
+                logLine("harness exited (" + exitReason(code) + ") after " + (lived / 1000)
                         + "s; not restarting");
                 if (lived < 10000) {
                     // Died on takeoff: leave the pieces' verdict in the log without
@@ -1221,10 +2038,22 @@ public class NodeServer extends Service {
                         } else {
                             Log.i(TAG, line);
                         }
-                        logLine(line);
+                        logLine(stamp() + " " + line);
                         String url = extractUrl(line);
                         if (url != null) {
                             sUrl = url;
+                            sToken = tokenOf(url);
+                            int announced = portOf(url);
+                            if (announced > 0) {
+                                port = announced;
+                            }
+                            if (announced > 0 && sToken != null) {
+                                // The only moment the token can be captured: the harness
+                                // prints it once and keeps it in memory afterwards, so
+                                // this write is what lets a later app process log into
+                                // the process that is still running.
+                                rememberWebEndpoint(announced, sToken);
+                            }
                             for (Listener l : LISTENERS) {
                                 l.onReady(url, sToken);
                             }
@@ -1260,6 +2089,87 @@ public class NodeServer extends Service {
         }
         String url = line.substring(i, end);
         return url.startsWith("http://127.0.0.1:") ? url : null;
+    }
+
+    /** The port in a loopback URL, or -1. */
+    private static int portOf(String url) {
+        String prefix = "http://127.0.0.1:";
+        if (!url.startsWith(prefix)) {
+            return -1;
+        }
+        int i = prefix.length();
+        int end = i;
+        while (end < url.length() && Character.isDigit(url.charAt(end))) {
+            end++;
+        }
+        if (end == i) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(url.substring(i, end));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /** The `?token=` value of an app URL, or null. */
+    private static String tokenOf(String url) {
+        int at = url.indexOf("?token=");
+        if (at < 0) {
+            return null;
+        }
+        int i = at + "?token=".length();
+        int end = i;
+        while (end < url.length() && tokenChar(url.charAt(end))) {
+            end++;
+        }
+        return end > i ? url.substring(i, end) : null;
+    }
+
+    /** True while a child process is still alive (exitValue throws while it runs). */
+    private static boolean stillRunning(Process p) {
+        if (p == null) {
+            return false;
+        }
+        try {
+            p.exitValue();
+            return false;
+        } catch (IllegalThreadStateException alive) {
+            return true;
+        }
+    }
+
+    /**
+     * Say what an exit code means, because "code 130" tells nobody anything.
+     *
+     * A shell reports a fatal signal as 128+N, so 130 is SIGINT and 143 is SIGTERM.
+     * The runtime dying that way is not a crash -- someone signalled it -- and the
+     * difference decides where to look. Logging the signal name is the whole point.
+     */
+    /**
+     * Wall-clock prefix for every harness line.
+     *
+     * The harness prints no timestamps of its own, so two events could not be
+     * ordered after the fact -- which is exactly what made the port/screen-flicker
+     * hunt take a whole round: we could see the lines but not when they happened.
+     */
+    private static String stamp() {
+        return new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+                .format(new java.util.Date());
+    }
+
+    private static String exitReason(int code) {
+        if (code > 128 && code < 160) {
+            String[] names = {"HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE",
+                    "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM"};
+            int n = code - 128;
+            String name = n >= 1 && n <= names.length ? "SIG" + names[n - 1] : "signal " + n;
+            return "code " + code + " -- killed by " + name + " (128+" + n + ")";
+        }
+        if (code == 0) {
+            return "code 0 -- clean exit";
+        }
+        return "code " + code;
     }
 
     private static int freePort(int start) {

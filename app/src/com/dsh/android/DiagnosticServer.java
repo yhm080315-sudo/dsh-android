@@ -145,8 +145,43 @@ final class DiagnosticServer {
         externalLog = target;
     }
 
+    /** Rotated copies kept beside dsh.log: dsh.log.1 is the previous run, up to .N. */
+    static final int LOG_GENERATIONS = 5;
+
+    /** One rotation per app process, on the first line that process writes. */
+    private static boolean logRotated;
+
+    /**
+     * Rotate before the first line of a run.
+     *
+     * The log is the only evidence that outlives a crash, and a restarted app wrote
+     * into the same file -- so the run that died was progressively overwritten by the
+     * run that replaced it, which is the one that has to be read afterwards. Rotating
+     * on the first write, rather than in whichever component comes up first, keeps a
+     * whole run in one file whichever way the process was started (Activity, sticky
+     * service restart, or both).
+     */
+    private static void rotateLogOnce(File filesDir) {
+        if (logRotated) {
+            return;
+        }
+        logRotated = true;
+        new File(filesDir, "dsh.log." + LOG_GENERATIONS).delete();
+        for (int i = LOG_GENERATIONS - 1; i >= 1; i--) {
+            File from = new File(filesDir, "dsh.log." + i);
+            if (from.isFile() && !from.renameTo(new File(filesDir, "dsh.log." + (i + 1)))) {
+                Log.w(TAG, "cannot rotate " + from.getAbsolutePath());
+            }
+        }
+        File current = new File(filesDir, "dsh.log");
+        if (current.isFile() && !current.renameTo(new File(filesDir, "dsh.log.1"))) {
+            Log.w(TAG, "cannot rotate " + current.getAbsolutePath());
+        }
+    }
+
     /** Keep a rolling on-disk copy so a crashed run can still be inspected. */
     static synchronized void appendLog(File filesDir, String line) {
+        rotateLogOnce(filesDir);
         appendTo(new File(filesDir, "dsh.log"), line, MAX_LOG_CHARS);
         if (externalLog != null) {
             appendTo(externalLog, line, 256 * 1024);

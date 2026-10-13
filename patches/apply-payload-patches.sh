@@ -261,6 +261,162 @@ patch(
     "P16a canOpenNativePath 认 android",
 )
 
+# ── P17: 工具的中断信号会打死 harness 本身 ──────────────────────────────────
+# 现场：agent 的 bash 工具被中断时，terminal 会对前台进程发 SIGINT；这个信号也送到
+# harness，而 harness 自己注册了 process.on("SIGINT") → interrupt(130) → 直接关停。
+# 表现是"测到一半自己退出，退出码 130，没有崩溃、没有报错"。setsid 挡不住（它按进程组发）。
+# Android 上不需要 SIGINT 关停 —— App 停运行时用的是 SIGTERM（SIGTERM 分支保留不动）。
+patch(
+    "@deepseek-ai/dsh/lib/profile-boot-BZ2ZjNWi.js",
+    """		process.on(\"SIGINT\", () => {
+			interrupt(130);
+		});""",
+    """		process.on(\"SIGINT\", () => {
+			/* dsh-sigint-ignored */
+			console.error(\"[dsh] SIGINT ignored (the shell tool's interrupt reached the harness)\");
+		});""",
+    "dsh-sigint-ignored",
+    "P17 SIGINT 不再关停 harness",
+)
+# 另一半：SIGTERM 也要留痕。exit 0 与"事件循环自然结束"无法区分，
+# 这正是每次都要多花一轮才能定位的原因。
+patch(
+    "@deepseek-ai/dsh/lib/profile-boot-BZ2ZjNWi.js",
+    """		process.on(\"SIGTERM\", () => {
+			interrupt(0);
+		});""",
+    """		process.on(\"SIGTERM\", () => {
+			/* dsh-sigterm-logged */
+			console.error(\"[dsh] SIGTERM received -> shutting down (exit 0)\");
+			interrupt(0);
+		});""",
+    "dsh-sigterm-logged",
+    "P17b SIGTERM 留痕",
+)
+
+# ── P16: 抢救式读取之后必须重建日志，否则新事件永久消失 ─────────────────────
+# 现场（2026-10-13，共四份日志）：seq 断号或"完整帧里出现撕裂记录"。
+# 新版读取已经能服务连续前缀，但写打开不重建 —— 追加的事件落在损坏字节之后，
+# 而之后每次读取只认连续前缀：实测三份原始日志 100% 复现（例：追加前 3021 行 →
+# 落盘 3022 行、10 处断号、重读仍是 2953 事件，新事件消失）。
+# 这里在写打开时按完整事件流重建（先备份原始字节、再原子替换），
+# 不依赖"物理行 ↔ 逻辑事件"的换算，任何折叠/替换语义都不会算错。
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """			const complete = scanner.checkpoint();
+			if (complete.committedBytes !== complete.inputBytes) {
+				/* Same reasoning as above: serve the complete prefix instead of refusing
+				 * the whole log. */
+				console.error("[session] torn JSONL record in the last complete frame; serving the intact prefix");
+			}""",
+    """			const complete = scanner.checkpoint();
+			/* 完整帧里出现接不上的记录：另一个写入者把自己的 seq 追加进了同一份日志。
+			 * 只服务连续前缀还不够 —— 必须让写入方知道要重建日志，否则新事件会追加在损坏
+			 * 字节之后，而之后每次读取只认连续前缀，新事件就此永久消失（三份现场日志 100% 复现）。 */
+			let salvaged = false;
+			if (complete.committedBytes !== complete.inputBytes) {
+				/* Same reasoning as above: serve the complete prefix instead of refusing
+				 * the whole log. */
+				salvaged = true;
+				console.error("[session] torn JSONL record in the last complete frame; serving the intact prefix (the next write rebuilds the log)");
+			}
+""",
+    "let salvaged = false;",
+    "P16a 抢救时打标记",
+)
+
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """			if (tornStart === void 0) {
+				const prefix = scanner.finish();
+				return {
+					meta: prefix.meta,
+					inheritedEventCount: prefix.inheritedEventCount,
+					events: prefix.events,
+					tornTruncateTo: void 0,
+					recoveredTail: []
+				};
+			}
+			let recoveredPlaintext = Buffer.alloc(0);""",
+    """			if (tornStart === void 0) {
+				const prefix = scanner.finish();
+				return {
+					meta: prefix.meta,
+					inheritedEventCount: prefix.inheritedEventCount,
+					events: prefix.events,
+					tornTruncateTo: void 0,
+					recoveredTail: [],
+					salvaged
+				};
+			}
+			let recoveredPlaintext = Buffer.alloc(0);""",
+    "salvaged\n\t\t\t\t};",
+    "P16b 标记随返回值带出",
+)
+
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """			const prepared = await this.requireStoredLog(id, options?.signal);
+			options?.signal?.throwIfAborted();
+			let stored;
+			if (prepared.status === "prepared") stored = await this.publishStoredMigration(id, prepared);
+			else stored = prepared;
+			options?.signal?.throwIfAborted();
+			return this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, "write", {""",
+    """			const prepared = await this.requireStoredLog(id, options?.signal);
+			options?.signal?.throwIfAborted();
+			let stored;
+			if (prepared.status === "prepared") stored = await this.publishStoredMigration(id, prepared);
+			else stored = prepared;
+			options?.signal?.throwIfAborted();
+			/* 抢救过的日志里还留着损坏尾部：先按完整事件流重建，再让句柄追加，
+			 * 否则新事件会落在损坏字节之后而永久读不回来。 */
+			if (stored.salvaged === true) await this.rewriteSalvagedLog(stored);
+			return this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, "write", {""",
+    "rewriteSalvagedLog(stored)",
+    "P16c 写打开时重建日志",
+)
+
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """	async repair(meta, offset) {
+		const path = logPath(this.root, meta.cwd, meta.id, this.compression);
+		await truncate(path, offset);""",
+    """	/**
+	* 把"被抢救过"的日志重建成单一连续事件流：先留证据，再原子替换。
+	* 不依赖物理行与逻辑事件的换算，任何折叠/替换语义都不会算错截断点。
+	* @param stored - the salvaged stored log to rebuild from.
+	*/
+	async rewriteSalvagedLog(stored) {
+		const meta = stored.meta;
+		const path = logPath(this.root, meta.cwd, meta.id, this.compression);
+		const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "");
+		await copyFile(path, `${path}.corrupt-${stamp}.bak`).catch(() => {});
+		const headerValue = sessionFormatCatalog.encodeCurrentHeader(meta, stored.inheritedEventCount);
+		const headerLine = Buffer.from(`${stringifyJson(headerValue, "session header")}\n`);
+		const parts = [this.compression === "zstd" ? await compressZstdFrame(headerLine) : headerLine];
+		for (let offset = 0; offset < stored.events.length; offset += 512) parts.push(await this.encodeEventBatch(stored.events.slice(offset, offset + 512)));
+		const staged = `${path}.repair-${process.pid}.tmp`;
+		await writeFile(staged, Buffer.concat(parts));
+		await rename(staged, path);
+		this.coldLogMemo.delete(meta.id);
+		console.error(`[session] session "${meta.id}": rebuilt the log from its ${stored.events.length}-event intact prefix; damaged bytes kept as .corrupt-${stamp}.bak`);
+	}
+	async repair(meta, offset) {
+		const path = logPath(this.root, meta.cwd, meta.id, this.compression);
+		/* 自动修复会永久删掉损坏字节：先留一份证据（两次事故都是靠它定位的）。 */
+		const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+/, "");
+		await copyFile(path, `${path}.corrupt-${stamp}.bak`).catch(() => {});
+		await truncate(path, offset);""",
+    # 原条目写的是 "rebuilds the log"，但那个字符串只出现在 P16a 的 replacement 里，
+    # 这一条的 replacement 实际写的是 "rebuilt the log from its ... intact prefix"：
+    # 假 note 会让它永远不被识别成「已打过」（第二次运行只会报「锚点不匹配」），
+    # 而且 P16a 一旦先落盘，这个假 note 又会被 P16a 的文本误命中 → 本条被静默跳过。
+    # 这里只把 note 换成 replacement 里真实存在的子串，anchor 与 replacement 一字未动。
+    "rebuilt the log from its",
+    "P16d/P17 重建方法 + 修复前备份",
+)
+
 # ── P5: 图片处理不依赖原生 sharp（备用路径）────────────────────────────────
 # 说明：完整的纯 JS 头部解析实现较长，这里只做「不因缺少 sharp 而整体失败」的兜底；
 # 若需要完整的图片能力，请参考 docs/PITFALLS.md 第 5 条自行补全解析器。
@@ -444,6 +600,113 @@ patch(
     "dsh-create.lock",
     "P11 新建文件改用锁 + rename 发布",
 )
+
+# ── P19: 开机动画客户端在「页面重载瞬间」没有可重试的失败处理 ──────────────
+# 现场（/sdcard/DSH/work/client-retry-fix/HANDOFF.md、P18-P19.md）：
+#   resume/重载瞬间 /dsh-boot-animation/media/... 与 /plugins/events 各失败 1~2 次。
+#   空闲时两条端点实测都是健康的（媒体 200 + 1856280 B，SSE text/event-stream），
+#   所以不是缺路由、不是错 id —— 是页面重载瞬间的网络竞态。
+#   真缺陷在这里：媒体只有 25s「卡住超时」，没有 error 重试 → 首帧竞态会让开机动画整段跳过。
+# 交付：/sdcard/DSH/work/fixes-for-packaging/（成品 dsh-boot-animation-client.js，
+#       md5 99bb868ce27639e58c4ca771207b7138；原始 md5 30f60c790f4a3099dce2b16d041d8157）。
+# 说明：她的 blocks-P19.py 里 note 写的是中文标签（人读的），而本脚本的幂等判据是
+#       `if note in text:` —— 假 note 会让第二次运行重复插入（replacement 以锚点开头，
+#       锚点仍在文本里）。这里 anchor / replacement 一字未动，只把 note 换成各自
+#       replacement 里真实存在的子串（见 P16d 那条的同类说明）。
+#       P19d-1/2/3（fetchWithRetry）她的 blocks 文件里没有，是从她的 .orig→.patched
+#       逐行 diff 里原样取出的，没有改动她的任何逻辑。
+patch(
+    "dsh-boot-animation/lib/client.js",
+    """		/** How long an error stays readable before the overlay closes itself. */
+		const ERROR_LINGER_MS = 8e3;""",
+    """		/** How long an error stays readable before the overlay closes itself. */
+		const ERROR_LINGER_MS = 8e3;
+		/*
+		 * Delays for retrying the clip's first media request. Measured on device: a page
+		 * load can fail this request at t+1003ms AND at t+3630ms before it succeeds, so a
+		 * short window is not enough -- this schedule covers ~9.5s in total.
+		 */
+		const MEDIA_RETRY_DELAYS_MS = [300, 700, 1500, 3000, 4000];""",
+    "const MEDIA_RETRY_DELAYS_MS = [300, 700, 1500, 3000, 4000];",
+    "P19a 媒体首帧竞态：新增退避表 [300,700,1500,3000,4000]ms",
+)
+patch(
+    "dsh-boot-animation/lib/client.js",
+    """				video.addEventListener("playing", onPlaying);""",
+    """				video.addEventListener("playing", onPlaying);
+				/*
+				 * The first media request can race a page reload and fail at the network layer
+				 * although the route is healthy (measured: 200 + 1856280 B via curl, while the
+				 * WebView failed twice per load). Retry with backoff instead of waiting for the
+				 * 25s stall timeout, which skipped the whole clip.
+				 */
+				let mediaRetries = 0;
+				const onMediaError = () => {
+					if (closedRef.current || mediaRetries >= MEDIA_RETRY_DELAYS_MS.length) return;
+					const delay = MEDIA_RETRY_DELAYS_MS[mediaRetries];
+					mediaRetries += 1;
+					report("media error, retry " + String(mediaRetries) + " in " + String(delay) + "ms");
+					window.setTimeout(() => {
+						if (closedRef.current) return;
+						video.src = url;
+						video.load();
+						const again = video.play();
+						if (again !== void 0 && typeof again.catch === "function") again.catch(() => {});
+					}, delay);
+				};
+				video.addEventListener("error", onMediaError);""",
+    "const onMediaError = () => {",
+    "P19b 媒体 error 时按退避表重试 5 次（覆盖 ~9.5s）",
+)
+patch(
+    "dsh-boot-animation/lib/client.js",
+    """					video.removeEventListener("playing", onPlaying);""",
+    """					video.removeEventListener("playing", onPlaying);
+					video.removeEventListener("error", onMediaError);""",
+    'video.removeEventListener("error", onMediaError);',
+    "P19c 卸载时移除 error 监听",
+)
+patch(
+    "dsh-boot-animation/lib/client.js",
+    """		const BASE = "/dsh-boot-animation";""",
+    """		const BASE = "/dsh-boot-animation";
+		/*
+		 * Fetch with retries: a page load can reach the host before its loopback connection
+		 * is ready, and the first attempt then fails although the route is healthy (measured:
+		 * 200 + 1856280 B via curl while the WebView failed twice per load).
+		 */
+		async function fetchWithRetry(url, options, delays) {
+			const schedule = delays ?? [300, 700, 1500, 3000, 4000];
+			let last;
+			for (let attempt = 0; attempt <= schedule.length; attempt++) {
+				try {
+					return await fetch(url, options);
+				} catch (error) {
+					last = error;
+					if (attempt === schedule.length) break;
+					await new Promise((resolve) => setTimeout(resolve, schedule[attempt]));
+				}
+			}
+			throw last;
+		}""",
+    "async function fetchWithRetry(url, options, delays) {",
+    "P19d-1 目录/解析请求走带退避的 fetchWithRetry",
+)
+patch(
+    "dsh-boot-animation/lib/client.js",
+    """					const response = await fetch(this.#listUrl(), { cache: "no-store" });""",
+    """					const response = await fetchWithRetry(this.#listUrl(), { cache: "no-store" });""",
+    'await fetchWithRetry(this.#listUrl(), { cache: "no-store" })',
+    "P19d-2 目录清单改走 fetchWithRetry",
+)
+patch(
+    "dsh-boot-animation/lib/client.js",
+    """					const response = await fetch(`${RESOLVE_URL}?mode=${mode}${param === "" ? "" : "&" + param}`, { cache: "no-store" });""",
+    """					const response = await fetchWithRetry(`${RESOLVE_URL}?mode=${mode}${param === "" ? "" : "&" + param}`, { cache: "no-store" });""",
+    "await fetchWithRetry(`${RESOLVE_URL}?mode=${mode}",
+    "P19d-3 resolve 请求改走 fetchWithRetry",
+)
+
 
 # ── P12: Grep / Glob 在 android-arm64 上找不到 ripgrep ─────────────────────
 # @vscode/ripgrep 按 `@vscode/ripgrep-${process.platform}-${arch}` 解析二进制，
