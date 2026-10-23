@@ -99,7 +99,7 @@ MANIFEST="$WORK/AndroidManifest.xml"
     --min-sdk-version 24 --target-sdk-version 28 \
     "${RES_ARGS[@]+"${RES_ARGS[@]}"}"
 
-find "$APP/src" "$WORK/gen" -name '*.java' > "$WORK/sources.txt"
+find "$APP/src" "$WORK/gen" "$WORK/r" -name '*.java' > "$WORK/sources.txt"
 javac -source 8 -target 8 -encoding UTF-8 -nowarn \
       -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" \
       -d "$WORK/classes" @"$WORK/sources.txt"

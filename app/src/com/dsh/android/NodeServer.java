@@ -1093,8 +1093,8 @@ public class NodeServer extends Service {
      * that shared storage is reachable, and how to obtain root.
      */
     private void writeAgentInstructions(File workspace) {
-        String body = ""
-                + "# 语言 / Language\n"
+        String language = "zh".equals(java.util.Locale.getDefault().getLanguage())
+                ? "# 语言 / Language\n"
                 + "\n"
                 + "用用户所用的语言回答。本机用户使用中文：除非用户改用别的语言，\n"
                 + "**一律用中文**——正文、计划、提问、总结都是中文。\n"
@@ -1104,6 +1104,14 @@ public class NodeServer extends Service {
                 + "Chinese, so answer in Chinese unless they switch. Keep code, commands,\n"
                 + "paths, identifiers and quoted English text as they are.\n"
                 + "\n"
+                : "# Language\n"
+                + "\n"
+                + "Reply in the language the user writes in. Default to English unless the user\n"
+                + "writes in another language. Use that language for prose, plans, questions and\n"
+                + "summaries. Keep code, commands, file paths, identifiers and quoted English\n"
+                + "source text as they are.\n"
+                + "\n";
+        String body = language
                 + "# Android environment\n"
                 + "\n"
                 + "You are running inside the **DeepSeek Harness Android app** (com.dsh.android),\n"

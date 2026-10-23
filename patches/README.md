@@ -1,3 +1,4 @@
+[English](README.en.md) | 中文
 # 负载补丁
 
 `apply-payload-patches.sh` 把 DSH 负载改造成能在 Android 应用沙箱里运行。

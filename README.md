@@ -1,3 +1,4 @@
+[English](README.en.md) | 中文
 # DSH for Android
 
 把 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（下称 DSH）打包成**独立 Android 应用**。
