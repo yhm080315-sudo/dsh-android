@@ -724,13 +724,14 @@ final class DeviceServer {
             sendIntent.setType(type);
             sendIntent.putExtra(android.content.Intent.EXTRA_STREAM, FileBridge.uriFor(file));
             sendIntent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            android.content.Intent chooser =
-                    android.content.Intent.createChooser(sendIntent, "打开 " + file.getName());
-            chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
             if (appContext == null) {
                 send(socket, 500, "application/json", "{\"error\":\"no context\"}".getBytes("UTF-8"));
                 return;
             }
+            android.content.Intent chooser =
+                    android.content.Intent.createChooser(sendIntent,
+                            appContext.getString(R.string.open_file, file.getName()));
+            chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
             appContext.startActivity(chooser);
             send(socket, 200, "application/json",
                     ("{\"opened\":\"" + file.getName().replace("\"", "") + "\"}").getBytes("UTF-8"));

@@ -268,7 +268,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
      */
     private void checkForUpdate() {
         updateButton.setEnabled(false);
-        statusView.setText("正在检查更新…");
+        statusView.setText(getString(R.string.checking_for_updates));
         nl();
         final String prefix = "update";
         logView.append("[" + prefix + "] feed: " + SelfUpdater.feedUrl(getFilesDir()) + "\n");
@@ -290,8 +290,8 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                     @Override
                     public void run() {
                         updateButton.setEnabled(true);
-                        updateButton.setText("安装 " + apk.getName());
-                        statusView.setText("更新已就绪：" + apk.getName());
+                        updateButton.setText(getString(R.string.install_update, apk.getName()));
+                        statusView.setText(getString(R.string.update_ready, apk.getName()));
                         logView.append("[" + prefix + "] ready: " + apk.getAbsolutePath()
                                 + " (" + apk.length() + " bytes)\n");
                         try {
@@ -309,7 +309,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                     @Override
                     public void run() {
                         updateButton.setEnabled(true);
-                        statusView.setText("更新失败：" + reason);
+                        statusView.setText(getString(R.string.update_failed, reason));
                         statusView.setTextColor(theme.err);
                         logView.append("[" + prefix + "] failed: " + reason + "\n");
                     }
@@ -357,7 +357,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                     public void run() {
                         probeButton.setEnabled(true);
                         logView.append(text);
-                        statusView.setText("自检完成，结果见下方日志");
+                        statusView.setText(getString(R.string.self_check_finished));
                     }
                 });
             }
@@ -619,9 +619,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         try {
             android.content.pm.PackageInfo info = getPackageManager()
                     .getPackageInfo(getPackageName(), 0);
-            version.setText("版本 " + info.versionName);
+            version.setText(getString(R.string.version, info.versionName));
         } catch (Throwable t) {
-            version.setText("版本 未知");
+            version.setText(getString(R.string.version_unknown));
         }
         version.setTextSize(12f);
         version.setTextColor(theme.dim);
@@ -639,10 +639,10 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         slp.bottomMargin = (int) (16 * d);
-        statusView.setText("正在启动内置运行环境…");
+        statusView.setText(getString(R.string.starting_runtime));
         logPanel.addView(statusView, slp);
 
-        resumeButton = action("返回界面", true);
+        resumeButton = action(getString(R.string.back_to_app), true);
         resumeButton.setVisibility(View.GONE);
         resumeButton.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -652,7 +652,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(resumeButton);
 
-        Button bgButton = action("换背景图", false);
+        Button bgButton = action(getString(R.string.change_background), false);
         bgButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -661,7 +661,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(bgButton);
 
-        rootButton = action("授予 root 权限", false);
+        rootButton = action(getString(R.string.grant_root_access), false);
         rootButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -672,7 +672,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(rootButton);
 
-        storageButton = action("授予文件访问", false);
+        storageButton = action(getString(R.string.grant_file_access), false);
         storageButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -682,7 +682,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(storageButton);
 
-        probeButton = action("运行环境自检", false);
+        probeButton = action(getString(R.string.run_self_check), false);
         probeButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -691,7 +691,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(probeButton);
 
-        updateButton = action("检查更新", false);
+        updateButton = action(getString(R.string.check_for_updates), false);
         updateButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -700,20 +700,20 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(updateButton);
 
-        Button copy = action("复制日志", false);
+        Button copy = action(getString(R.string.copy_log), false);
         copy.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 android.content.ClipboardManager cm = (android.content.ClipboardManager)
                         getSystemService(CLIPBOARD_SERVICE);
                 cm.setPrimaryClip(android.content.ClipData.newPlainText("dsh log", logView.getText()));
-                statusView.setText("日志已复制到剪贴板");
+                statusView.setText(getString(R.string.log_copied));
             }
         });
         logPanel.addView(copy);
 
         TextView logLabel = new TextView(this);
-        logLabel.setText("运行日志");
+        logLabel.setText(getString(R.string.run_log));
         logLabel.setTextSize(12f);
         logLabel.setTextColor(theme.dim);
         LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
@@ -767,7 +767,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
         // a chip that brings the log back while the UI is on screen
         logChip = new TextView(this);
-        logChip.setText("日志");
+        logChip.setText(getString(R.string.log));
         logChip.setTextSize(13f);
         logChip.setTextColor(theme.text);
         logChip.setBackground(plate(alpha(theme.card), 20f));
@@ -1208,7 +1208,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
     private void attachWeb(String url) {
         if (diagnostics) {
-            statusView.setText("诊断模式：运行环境就绪 " + url);
+            statusView.setText(getString(R.string.diagnostic_runtime_ready, url));
             return;
         }
         if (webAttached) {
@@ -1416,7 +1416,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         ui.post(new Runnable() {
             @Override
             public void run() {
-                statusView.setText("已就绪：" + url);
+                statusView.setText(getString(R.string.runtime_ready, url));
                 statusView.setTextColor(theme.ok);
                 // The service reports the endpoint on a worker thread; the view is
                 // this Activity's own business, so the load is driven from here.
@@ -1430,7 +1430,7 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         ui.post(new Runnable() {
             @Override
             public void run() {
-                statusView.setText("运行环境已退出（代码 " + code + "），详见日志");
+                statusView.setText(getString(R.string.runtime_exited, code));
                 statusView.setTextColor(theme.err);
                 showLog();
             }

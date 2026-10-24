@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Original Chinese app UI strings. -->
+<resources>
+    <string name="checking_for_updates">正在检查更新…</string>
+    <string name="install_update">安装 %1$s</string>
+    <string name="update_ready">更新已就绪：%1$s</string>
+    <string name="update_failed">更新失败：%1$s</string>
+    <string name="self_check_finished">自检完成，结果见下方日志</string>
+    <string name="version">版本 %1$s</string>
+    <string name="version_unknown">版本 未知</string>
+    <string name="starting_runtime">正在启动内置运行环境…</string>
+    <string name="back_to_app">返回界面</string>
+    <string name="change_background">换背景图</string>
+    <string name="grant_root_access">授予 root 权限</string>
+    <string name="grant_file_access">授予文件访问</string>
+    <string name="run_self_check">运行环境自检</string>
+    <string name="check_for_updates">检查更新</string>
+    <string name="copy_log">复制日志</string>
+    <string name="log_copied">日志已复制到剪贴板</string>
+    <string name="run_log">运行日志</string>
+    <string name="log">日志</string>
+    <string name="diagnostic_runtime_ready">诊断模式：运行环境就绪 %1$s</string>
+    <string name="runtime_ready">已就绪：%1$s</string>
+    <string name="runtime_exited">运行环境已退出（代码 %1$d），详见日志</string>
+    <string name="open_file">打开 %1$s</string>
+</resources>
