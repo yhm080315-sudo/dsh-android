@@ -4,7 +4,7 @@
 把 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)（下称 DSH）打包成**独立 Android 应用**。
 
 装一个 APK 就能用：**不需要 Termux、不需要 proot、不需要电脑**。运行时（Node、bash、ripgrep、coreutils）全部内嵌在 APK 里。
-设备操控（看屏幕/点按/输入）需要提权通道：**Shizuku（推荐，不需要 root）或 root**，详见「设备能力」一节。
+设备操控（看屏幕/点按/输入）需要一条提权通道。**不装任何东西也能用**：打开无障碍 + 授权一次投屏即可；想要更省事可以装 Shizuku；有 root 也支持。详见「设备能力」一节。
 
 > **状态**：可用。已在小米 2509FPN0BC / Android 17 上验证（截屏、点按、文件读写、图片上传、插件系统均正常）。
 > **代价**：`targetSdk` 必须是 28，因此**无法上架 Google Play**。原因见 [docs/PITFALLS.md](docs/PITFALLS.md)。
@@ -48,11 +48,12 @@ App 首次运行会写一份带全部键和默认值的 `theme.example.conf` 供
 
 - Linux 构建机（x86_64 或 aarch64 均可）
 - JDK 21
-- `android-sdk/build-tools/29.0.3`（提供 `aapt2` / `zipalign` / `apksigner` / `dalvik-exchange`）
+- `android-sdk/build-tools/29.0.3`（提供 `aapt2` / `zipalign` / `apksigner`）
+- **D8**（R8 发行包里的 `r8.jar`，dex 由它生成；`dalvik-exchange`/dx 编不了 Shizuku 的 invokedynamic）
 - Android platform jar（**API 30**）
 - Node.js（用于 `install-dsh.sh` 拉包）
 
-**注意：不需要 Gradle。** 本项目用 `aapt2 → javac → dx → zipalign → apksigner` 手工打包。
+**注意：不需要 Gradle。** 本项目用 `aapt2 → javac → D8 → zipalign → apksigner`（D8 而非 dx：Shizuku 的库用了 invokedynamic，dx 编不了） 手工打包。
 
 ### 三步构建
 
@@ -75,13 +76,13 @@ bash scripts/build-app.sh
 `AndroidManifest.xml` 和文档都从它读，不在两处各写一遍。
 
 ```
-APP_VERSION=1.0.1            本项目版本（对应 Git tag v1.0.1）
-APP_VERSION_CODE=10001       Android versionCode（= 1*10000 + 0*100 + 1）
-DSH_VERSION=0.2.0-rc.2       内嵌的 DeepSeek Harness 版本
+APP_VERSION=1.0.19           本项目版本（对应 Git tag v1.0.19）
+APP_VERSION_CODE=10019       Android versionCode（= 1*10000 + 0*100 + 19；清单里也要改，aapt2 的 --version-code 只在清单没写时生效）
+DSH_VERSION=0.2.1-rc.2       内嵌的 DeepSeek Harness 版本
 ```
 
-APK 的 `versionName` 把两层都带上：**`1.0.1+dsh.0.2.0-rc.2`**，
-产物名为 `DSH-Android-v1.0.1-dsh0.2.0-rc.2.apk`。
+APK 的 `versionName` 把两层都带上：**`1.0.19+dsh.0.2.1-rc.2`**，
+产物名为 `DSH-Android-v1.0.19-dsh0.2.1-rc.2.apk`。
 应用启动日志里也会打一行 `versions: app … · dsh …`——
 报 bug 时看这行就知道是哪一层的版本。
 
@@ -92,7 +93,7 @@ APK 的 `versionName` 把两层都带上：**`1.0.1+dsh.0.2.0-rc.2`**，
 ```
 
 ```bash
-apksigner verify --print-certs DSH-Android-v1.0.1-dsh0.2.0-rc.2.apk | grep "SHA-256 digest"
+apksigner verify --print-certs DSH-Android-v1.0.19-dsh0.2.1-rc.2.apk | grep "SHA-256 digest"
 ```
 
 ⚠️ **装过官方 APK 的人无法用自己构建的 APK 覆盖升级**——签名不同，Android 会拒绝安装，
@@ -211,33 +212,38 @@ glibc 原生模块加载失败、`dx` 静默丢类等等。**这些补丁是持�
 **如果目标是长期紧跟上游**，容器派在这种场景下更省事；
 **如果目标是体积小、启动快、不依赖 root**，本项目更合适。
 
-### 设备能力：Shizuku 优先，root 次之，都没有就明确报错
+### 设备能力：零安装优先，Shizuku 次之，root 最后
 
-`screencap` / `input` 只有 shell 或 root 能调用，普通应用调不了。应用里的 `DeviceShell`
+`screencap` / `input` 这类命令只有 shell 或 root 能调用，普通应用调不了。应用里的 `DeviceShell`
 **按操作类型**选后端，而不是全局只有一条通道：
 
 ```
-capture  → Backend.capture()            screencap（当前：Shizuku / su）
-input    → Backend.tap/swipe/key/text   input（当前：Shizuku / su）
-shell    → Backend.exec()               任意命令（只有 Shizuku / su 能做）
+capture  → Backend.capture()            MediaProjection（投屏）| screencap（Shizuku / su）
+input    → Backend.tap/swipe/key/text   无障碍 dispatchGesture / ACTION_SET_TEXT | input（Shizuku / su）
+shell    → Backend.exec()               任意命令（只有 Shizuku / su 能做，无障碍做不到）
 ```
 
-优先级：**Shizuku（已授权且服务在跑）→ su/root → 无（返回 `NO_PRIVILEGE` 并给安装/授权指引）**。
-状态行一眼可见，例如：
+优先级**按"用户要付出多少"排**，门槛最低的在前：
+
+| 顺序 | 通道 | 用户要做什么 | 能做什么 |
+|---|---|---|---|
+| 1 | **无障碍 + 投屏** | 设置里开无障碍 + 授权一次投屏 | 点按 ✓ 滑动 ✓ 输入 ✓ 读界面 ✓ 截图 ✓ |
+| 2 | **Shizuku** | 装 Shizuku，点一次允许 | 同上 + 任意 shell 命令 |
+| 3 | **root** | 已有 root | 全部 |
+| — | 都没有 | — | 返回 `NO_PRIVILEGE`，并给出上面三条的具体开启路径 |
+
+状态行一眼可见**每类操作各自走了哪条通道**：
 
 ```
-device: capture=screencap via Shizuku (adb uid=2000) | input=input via Shizuku (adb uid=2000) | shell=Shizuku (adb uid=2000)
+device: capture=MediaProjection | input=accessibility | shell=su | ui=accessibility
 ```
 
-- **Shizuku**：用户在 Shizuku 里点一次允许，应用拿到 adb 级权限，`screencap` / `input`
-  照常可用，**不需要 root**。控制台「提权通道（Shizuku / root）」按钮触发授权。
-- **root**：有 root 就直接走 `su -c`，与旧版行为一致。
-- **都没有**：屏幕/输入类调用直接失败，错误信息明确写 `NO_PRIVILEGE` 并说明去装/授权 Shizuku，
-  不会伪装成别的错误。
+几个实现上的点：
 
-后续按同一接口再挂 **MediaProjection（取帧）+ 无障碍服务（注入）** 即可：
-它们只要实现 `capture()` 或 `tap/swipe/text()`，路由表加一行，上层与插件都不用改。
-
+- **投屏授权在进程重启后失效**（系统的单次令牌语义），重新授权一次即可；控制台「投屏」那行会显示是否有效
+- **无障碍做不了截图**，所以 capture 这条路第一顺位是 MediaProjection，不是无障碍
+- 未授权时**不会静默失败**：错误信息里直接列出「开启无障碍 / 授权投屏 / 装 Shizuku / 用 root」四条路径
+- 三条通道都是同一个 `Backend` 接口的实现，加新通道只加一个类 + 路由表一行，上层与插件不动
 
 ## 为什么不用 Termux
 
