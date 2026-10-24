@@ -19,8 +19,23 @@
     <string name="log_copied">日志已复制到剪贴板</string>
     <string name="run_log">运行日志</string>
     <string name="log">日志</string>
+    <string name="console">控制台</string>
     <string name="diagnostic_runtime_ready">诊断模式：运行环境就绪 %1$s</string>
     <string name="runtime_ready">已就绪：%1$s</string>
     <string name="runtime_exited">运行环境已退出（代码 %1$d），详见日志</string>
     <string name="open_file">打开 %1$s</string>
+
+    <!-- 提权路由（1.0.19）：每种能力一条通道 -->
+    <string name="privilege_status">提权：%1$s</string>
+    <string name="privilege_channel_button">提权通道（Shizuku / root）</string>
+    <string name="accessibility_row_on">无障碍：已开启</string>
+    <string name="accessibility_row_off">无障碍：未开启（点击去设置）</string>
+    <string name="projection_row_on">投屏：已授权</string>
+    <string name="projection_row_on_failed">投屏：已授权（上次抓帧失败：%1$s）</string>
+    <string name="projection_row_off">投屏：未授权（点击授权）</string>
+
+    <!-- 系统设置 → 无障碍 → 已安装的应用 里显示在这款应用旁边 -->
+    <string name="accessibility_service_label">DeepSeek Harness 手机操控</string>
+    <string name="accessibility_summary">零安装的点按 / 滑动 / 输入 / 读界面</string>
+    <string name="accessibility_description">开启后，DeepSeek Harness 可以在不装 Shizuku、不用 root 的情况下点按、滑动、往输入框写字，并读取当前界面的控件结构。截图走单独的录屏授权，不经过这里。可随时在设置里关掉。</string>
 </resources>

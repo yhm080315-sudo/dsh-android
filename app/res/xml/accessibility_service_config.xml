@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Zero-install input channel.
+
+  canPerformGestures  -> dispatchGesture(): tap / swipe, no root and no Shizuku
+  canRetrieveWindowContent -> getRootInActiveWindow() for the UI summary and for
+  finding the focused editable node that ACTION_SET_TEXT writes into.
+  No event types beyond window changes: this service is pull-based, it never
+  reacts to what the user does, so it must not ask for more than it uses.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="100"
+    android:summary="@string/accessibility_summary" />

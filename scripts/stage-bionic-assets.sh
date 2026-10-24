@@ -88,12 +88,28 @@ du -sh "$STAGE/runtime" "$STAGE/runtime/usr" "$STAGE/runtime/dsh" 2>/dev/null
 ls "$STAGE/runtime/usr/bin" "$STAGE/runtime/usr/lib" | head -30
 echo OK
 
+# Third-party licence text travels inside the payload.
+#
+# BSD-3-Clause (dsh-boot-animation) requires the copyright notice and disclaimer
+# to accompany a binary distribution, and the payload is app-private -- unreachable
+# from the phone's file manager. The source of truth is repo-root
+# payload/THIRD-PARTY-NOTICES.md; DiagnosticServer prints the copy that lands at
+# files/runtime/ then so the text is reachable on the device.
+NOTICE_SRC="$HERE/../payload/THIRD-PARTY-NOTICES.md"
+if [ ! -f "$NOTICE_SRC" ]; then
+  echo "missing $NOTICE_SRC — the APK would ship without the BSD-3 notice" >&2
+  exit 1
+fi
+cp -f "$NOTICE_SRC" "$STAGE/runtime/THIRD-PARTY-NOTICES.md"
+echo "  notice THIRD-PARTY-NOTICES.md ($(wc -c < "$STAGE/runtime/THIRD-PARTY-NOTICES.md") bytes)"
+
 # Prove the payload is complete before anyone packs it: a partial tree is
 # otherwise indistinguishable from a good one to the packer.
 for sentinel in \
     "$STAGE/runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js" \
     "$STAGE/runtime/dsh/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js" \
-    "$STAGE/runtime/usr/bin/node"; do
+    "$STAGE/runtime/usr/bin/node" \
+    "$STAGE/runtime/THIRD-PARTY-NOTICES.md"; do
   if [ ! -f "$sentinel" ]; then
     echo "staging incomplete: $sentinel is missing" >&2
     exit 1

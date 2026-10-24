@@ -130,6 +130,21 @@ final class DiagnosticServer {
         sb.append("marker: ").append(marker.isFile())
                 .append(" state: ").append(state.isFile() ? read(state) : "(none)").append('\n');
 
+        sb.append("\n=== third-party notices ===\n");
+        /*
+         * The licence obligations (BSD-3-Clause for the boot animation) travel
+         * inside the payload, which is app-private and therefore invisible to the
+         * phone's file manager. Printing the file here is what makes it reachable
+         * from a place the user can actually open.
+         */
+        File notices = new File(runtime, "THIRD-PARTY-NOTICES.md");
+        sb.append("file: ").append(notices.getAbsolutePath())
+                .append(" present=").append(notices.isFile())
+                .append(" bytes=").append(notices.length()).append('\n');
+        if (notices.isFile()) {
+            sb.append(read(notices)).append('\n');
+        }
+
         sb.append("\n=== recent log ===\n");
         sb.append(tail(read(new File(filesDir, "dsh.log")), MAX_LOG_CHARS));
         return sb.toString();

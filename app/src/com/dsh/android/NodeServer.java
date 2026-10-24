@@ -704,11 +704,20 @@ public class NodeServer extends Service {
     /**
      * Client-side plugin rows the app adds to the profile.
      *
-     * All of them are browser-side presentation: the portrait layout fix and the
-     * two whale-themed skins the user runs on the desktop client. Each is a bundle
-     * whose own patch inserts exactly one loader row, so inserting the same row
-     * here is equivalent -- and works without the bundle list, which the harness
-     * writes itself.
+     * `dsh-web-mobile` is browser-side presentation and not optional: it is what
+     * makes the Web UI usable on a phone at all (the portrait/width fix --
+     * without it the desktop layout is unusable in a phone browser). Each plugin
+     * is a bundle whose own patch inserts exactly one loader row, so inserting
+     * the same row here is equivalent -- and works without the bundle list, which
+     * the harness writes itself.
+     *
+     * `dsh-boot-animation` used to be the second row: its client half played a
+     * full-frame intro. It was decorative, and the white-screen probe never
+     * needed it -- `window.__DSH_BOOT__`, which the probe used to read, is
+     * injected by the shell HTML itself (bundled `dsh-client-modules`), so the
+     * plugin's only contribution was one more entry in that manifest. Removed
+     * from the payload in 1.0.19-beta16; its insert row is now pruned by
+     * REMOVED_PLUGINS.
      */
     /** Profile rows the app turns off: HMR cannot run without --expose-internals. */
     private static final String[] DISABLED_ROWS = {"hmr"};
@@ -725,9 +734,41 @@ public class NodeServer extends Service {
 
     private static final String[][] CLIENT_ROWS = {
             {"dsh-web-mobile", "dsh-web-mobile"},
-            {"ui-skin-whale-fantasy-18", "dsh-skin-whale-fantasy"},
-            {"dsh-boot-animation-2", "dsh-boot-animation"},
-            {"dsh-pro-mode-splash-3", "dsh-pro-mode-splash"},
+    };
+
+    /**
+     * Plugins an earlier APK shipped and this one does not.
+     *
+     * A profile outlives an upgrade: `profiles/web/cordis.patch.yml` is user state,
+     * mirrored to /sdcard/DSH/.dsh-state, and the app only ever *appended* to it. So
+     * an insert row written by a build that had `dsh-skin-whale-fantasy` stays behind
+     * after the package leaves the payload, and the Loader then refuses the profile
+     * ("cannot resolve plugin") -- a startup failure caused entirely by a stale line.
+     * Pruned on every start; see pruneRemovedRows(). Keep this list forever: dropping
+     * a name from it just re-exposes older installs to the same failure.
+     */
+    private static final String[] REMOVED_PLUGINS = {
+            // CC-BY-NC-SA-4.0: non-commercial + share-alike, cannot ship inside an APK.
+            "dsh-skin-whale-fantasy",
+            // MIT, decorative only.
+            "dsh-pro-mode-splash",
+            /*
+             * Decorative only (BSD-3-Clause, so the licence was never the issue):
+             * a full-frame intro played once per launch. Removed at the user's
+             * request. Its row has to be pruned because older builds wrote it into
+             * the profile, and the probe that used to read the global it was
+             * thought to inject now judges the rendered page instead -- so nothing
+             * depends on it being loaded.
+             */
+            "dsh-boot-animation",
+            /*
+             * dsh-web-mobile is deliberately NOT here. It was listed once (MIT, and
+             * judged "layout tweak only"), but that judgement was wrong: it is the
+             * phone-UI adaptation, and a build that prunes its row boots into a
+             * desktop layout on a phone. It ships again, so its row must survive
+             * the prune -- a "removed" entry would delete the very row that makes
+             * the mobile UI work.
+             */
     };
 
     private void ensurePluginRows(File web) {
@@ -741,6 +782,18 @@ public class NodeServer extends Service {
                 int n = in.read(buf);
                 in.close();
                 existing = new String(buf, 0, Math.max(0, n), "UTF-8");
+            }
+            /*
+             * Prune before deciding what to append. The rows for plugins this build
+             * dropped are dead weight at best and a startup failure at worst, and the
+             * `existing.contains(row[1])` checks below would otherwise see the stale
+             * line and think the row is already in place.
+             */
+            String pruned = pruneRemovedRows(existing);
+            boolean removedRows = !pruned.equals(existing);
+            if (removedRows) {
+                logLine("profile patch: dropped rows for plugins this build no longer ships");
+                existing = pruned;
             }
 
             StringBuilder rows = new StringBuilder();
@@ -783,7 +836,7 @@ public class NodeServer extends Service {
                 // HMR needs --expose-internals, which a shipping build should not set.
                 off.append("- id: ").append(id).append("\n  disabled: true\n");
             }
-            if (rows.length() == 0 && off.length() == 0) {
+            if (rows.length() == 0 && off.length() == 0 && !removedRows) {
                 logLine("profile patch: all plugin rows present");
                 return;
             }
@@ -809,6 +862,96 @@ public class NodeServer extends Service {
         } catch (Throwable t) {
             logLine("plugin rows failed: " + t);
         }
+    }
+
+    /**
+     * Delete loader rows that name a plugin this build does not ship.
+     *
+     * Two shapes carry a plugin name in a profile patch: a bare row (`- id: x`
+     * followed by `  name: y`) and an insert block (`- insert:` followed by items
+     * at four spaces, each with its own `- id:` / `name:` lines). Both are walked
+     * the same way -- an entry starts at column 0, so everything indented belongs
+     * to the entry above it, and inside an insert block the next four-space `- `
+     * starts a new item. Messages and other keys below `name:` are left alone.
+     *
+     * Returns the text unchanged when nothing matched, so the caller can tell
+     * "already clean" from "cleaned" without diffing files.
+     */
+    private static String pruneRemovedRows(String text) {
+        String body = text.endsWith("\n") ? text.substring(0, text.length() - 1) : text;
+        if (body.isEmpty()) {
+            return text;
+        }
+        String[] lines = body.split("\n", -1);
+        List<String> out = new ArrayList<String>();
+        int i = 0;
+        while (i < lines.length) {
+            // Comments, blank lines and a bare `[]` are never part of an entry.
+            if (!lines[i].startsWith("- ")) {
+                out.add(lines[i]);
+                i++;
+                continue;
+            }
+            int end = i + 1;
+            while (end < lines.length && !lines[end].startsWith("- ")) {
+                end++;
+            }
+            if (lines[i].trim().equals("- insert:")) {
+                List<String> kept = new ArrayList<String>();
+                int item = i + 1;
+                while (item < end) {
+                    int itemEnd = item + 1;
+                    while (itemEnd < end && !lines[itemEnd].startsWith("    - ")) {
+                        itemEnd++;
+                    }
+                    if (!namesRemovedPlugin(lines, item, itemEnd)) {
+                        for (int k = item; k < itemEnd; k++) {
+                            kept.add(lines[k]);
+                        }
+                    }
+                    item = itemEnd;
+                }
+                // An empty `- insert:` parses as a null insert; drop the block instead.
+                if (!kept.isEmpty()) {
+                    out.add(lines[i]);
+                    out.addAll(kept);
+                }
+            } else if (!namesRemovedPlugin(lines, i, end)) {
+                for (int k = i; k < end; k++) {
+                    out.add(lines[k]);
+                }
+            }
+            i = end;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String line : out) {
+            sb.append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /** True when lines[from,to) carries a `name:` this build dropped. */
+    private static boolean namesRemovedPlugin(String[] lines, int from, int to) {
+        for (int k = from; k < to; k++) {
+            String t = lines[k].trim();
+            if (!t.startsWith("name:")) {
+                continue;
+            }
+            String value = t.substring("name:".length()).trim();
+            if (value.length() >= 2) {
+                char first = value.charAt(0);
+                char last = value.charAt(value.length() - 1);
+                if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
+                    value = value.substring(1, value.length() - 1);
+                }
+            }
+            for (String gone : REMOVED_PLUGINS) {
+                if (gone.equals(value)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -1088,11 +1231,42 @@ public class NodeServer extends Service {
     /**
      * Teach the agent about this device.
      *
-     * The harness reads AGENTS.md from the workspace, so this is the supported
-     * place for environment facts an agent cannot infer: where the workspace is,
-     * that shared storage is reachable, and how to obtain root.
+     * The harness reads AGENTS.md from the session's cwd, so this is the supported
+     * place for environment facts an agent cannot infer: where the session runs,
+     * that shared storage is reachable, and whether root exists on this phone.
+     *
+     * @param cwd the canonical directory the harness process is started in
      */
-    private void writeAgentInstructions(File workspace) {
+    private void writeAgentInstructions(File cwd) {
+        /*
+         * Root is a runtime fact, not a build-time one.
+         *
+         * The template used to state "the phone is rooted with KernelSU" for every
+         * device. On a locked-bootloader phone that is simply false, and the agent
+         * believed it: it tried `su -c ...` for screen control, got "not found",
+         * and then guessed at the environment. Probe once per start instead.
+         */
+        DeviceShell.awaitProbe(2500);
+        boolean rooted = hasRoot();
+        boolean shizuku = DeviceShell.isShizuku();
+        String shellRoute = shizuku ? "Shizuku" : rooted ? "su" : "none";
+        String rootedHint = rooted
+                ? "are readable with root (see below)."
+                : "are NOT readable here -- this phone is not rooted (see below).";
+        /*
+         * The cwd has to be spelled the way the harness sees it.
+         *
+         * Java keeps the /sdcard/DSH spelling the app chose; a child process gets
+         * its cwd from getcwd(2), which resolves /sdcard to /storage/emulated/0.
+         * The harness takes the session cwd from process.cwd(), so the template
+         * used to describe a path no session was actually in -- `pwd` disagreed
+         * with the instructions. cwd here is already canonical (see canonical()).
+         */
+        /*
+         * The language block follows the device locale: Chinese devices keep the
+         * byte-for-byte block this app shipped before, every other locale gets the
+         * English one with the same structure.
+         */
         String language = "zh".equals(java.util.Locale.getDefault().getLanguage())
                 ? "# 语言 / Language\n"
                 + "\n"
@@ -1119,12 +1293,14 @@ public class NodeServer extends Service {
                 + "\n"
                 + "## Where you are\n"
                 + "\n"
-                + "- Workspace (also your working directory): `" + workspace.getAbsolutePath() + "`\n"
+                + "- Your working directory (cwd) is `" + cwd.getAbsolutePath() + "`.\n"
+                + "  That is the exact path `pwd` prints -- use it for relative paths, and do not\n"
+                + "  assume a different spelling (`/sdcard/...`) is a different directory.\n"
                 + "- Shared storage is reachable: `/sdcard` is `/storage/emulated/0`.\n"
                 + "  `Download`, `Documents`, `DCIM`, `Pictures` and your own workspace are all readable\n"
                 + "  and writable. Files you create here are visible in the phone's file manager.\n"
                 + "- Prefer `/sdcard` paths for anything the user should be able to see or open.\n"
-                + "- Other apps' private data (`/data/data/*`) and system paths need root (see below).\n"
+                + "- Other apps' private data (`/data/data/*`) and system paths " + rootedHint + "\n"
                 + "\n"
                 + "## Shell\n"
                 + "\n"
@@ -1140,11 +1316,29 @@ public class NodeServer extends Service {
                 + "\n"
                 + "## Root\n"
                 + "\n"
-                + "- The phone is rooted with KernelSU; `/system/bin/su` is on `PATH`.\n"
+                + "- Device shell right now: **" + shellRoute + "** "
+                + "(capture/input/shell are routed per capability; see `device:` above).\n"
+                + (shizuku
+                ? "- Shizuku is authorised: the app runs device commands as adb shell (uid 2000),\n"
+                + "  with no root involved. `screencap` and `input` work that way.\n"
+                + "- Root is NOT available in this state. Do not try `su -c ...`: it will fail or\n"
+                + "  prompt. Read another app's `/data/data/<package>` only if root is also running.\n"
+                : rooted
+                ? "- This phone is rooted: the app ran `su -c id -u` at startup and it returned 0,\n"
+                + "  so `/system/bin/su` works.\n"
                 + "- Prefix a command with `su -c '<command>'` to run it as root. The first use may\n"
                 + "  raise the root manager's prompt on screen, which the user must accept.\n"
                 + "- Root is the only way to read another app's `/data/data/<package>` or system\n"
                 + "  paths. Ask before doing anything that writes outside `/sdcard`.\n"
+                : "- This phone is **not rooted**: the app ran `su -c id -u` at startup and did not\n"
+                + "  get 0 (no su, or the root manager refused).\n"
+                + "- Do not reach for `su`, `sudo`, Magisk or KernelSU: they are absent or refuse, and\n"
+                + "  every attempt costs a turn and produces a confusing error. Do not tell the user\n"
+                + "  that something \"needs root\" as if root were one command away.\n"
+                + "- Device control goes through the app instead of a root shell: the in-app HTTP\n"
+                + "  bridge below, plus Shizuku (`adb-shell`) when the user has authorised it.\n"
+                + "- Other apps' `/data/data/<package>` and system paths cannot be read here. Say so\n"
+                + "  instead of trying.\n")
                 + "\n"
                 + "## Notes\n"
                 + "\n"
@@ -1161,20 +1355,159 @@ public class NodeServer extends Service {
                 + "  It is NOT in the shell environment: the shell executor discards ambient `DSH_*`\n"
                 + "  values and injects only its own registry, so `$DSH_DEVICE_TOKEN` expands to\n"
                 + "  nothing. Easiest client is `dshdev` (tools/dshdev.js).\n"
-                + "- Most endpoints act through `su`, so they need root to have been granted.\n";
+                + "- `/device/shell?cmd=<command>&timeout=<sec>` runs one whitelisted command\n"
+                + "  (screencap/input/wm/dumpsys/am/cmd/pm/settings/...) through the same route and\n"
+                + "  returns raw stdout with `X-Exit-Code` and base64 `X-Stderr-B64` headers. This is\n"
+                + "  what the screen-operate plugin uses; prefer it to shelling out yourself.\n"
+                + "- Backing channel: **" + shellRoute + "**. "
+                + (shizuku
+                ? "Commands run as adb shell (uid 2000) via Shizuku, no root."
+                : rooted
+                ? "Commands run as root via `su`."
+                : "No channel: commands answer `NO_PRIVILEGE` with instructions.")
+                + "\n";
         /*
-         * Two copies, deliberately.
+         * Two copies, deliberately, and the same bytes in both.
          *
-         * The workspace one is what the harness calls a nested instruction file: it is
-         * only projected into a session once a file tool has touched a path inside that
-         * project. The baseline, which loads before the first request, comes from the
-         * session's cwd -- and a new session's cwd is /storage/emulated/0, where there
-         * is no AGENTS.md and no project root marker. So a new session used to start
-         * with no instructions at all: English answers, no screen tools, guessing at
-         * the environment. The user-level copy under $HOME/.dsh is cwd-independent.
+         * The baseline -- the one that loads before the first request -- comes from
+         * the session's cwd. The harness takes that cwd from process.cwd(), i.e. the
+         * directory this service starts the harness in, so the copy there is the
+         * one that always applies to a session started in this workspace.
+         *
+         * The copy under $DSH_HOME is cwd-independent: it still loads when the user
+         * makes a session somewhere else (a picked workspace, a subdirectory, or a
+         * session created before this workspace existed). It is what fixes "a new
+         * session answers in English and does not know the device".
          */
-        writeInstructions(new File(new File(homeDir(), ".dsh"), "AGENTS.md"), body);
-        writeInstructions(new File(workspace, "AGENTS.md"), body);
+        File userCopy = new File(dshHomeDir(), "AGENTS.md");
+        File cwdCopy = new File(cwd, "AGENTS.md");
+        writeInstructions(userCopy, body);
+        writeInstructions(cwdCopy, body);
+        /*
+         * One line of evidence, because "the file is not where the session looks"
+         * is invisible otherwise: it says where each copy landed, how big it is,
+         * and whether the cwd copy is the same bytes as the user copy.
+         */
+        logLine("agent instructions: cwd=" + cwd.getAbsolutePath()
+                + " cwdCopy=" + describeFile(cwdCopy)
+                + " userCopy=" + describeFile(userCopy)
+                + " root=" + (rooted ? "yes" : "no")
+                + " shizuku=" + (shizuku ? "yes" : "no"));
+    }
+
+    /** "3010b" / "missing" -- a size is enough to spot a truncated or absent file. */
+    private static String describeFile(File f) {
+        return f.isFile() ? f.length() + "b" : "missing";
+    }
+
+    /**
+     * Resolve the directory the way the kernel will report it to a child process.
+     *
+     * `/sdcard` is a symlink to `/storage/self/primary` -> `/storage/emulated/0`,
+     * so `getAbsolutePath()` and `getCanonicalPath()` differ on a real device
+     * while a child's `process.cwd()` always reports the resolved one.
+     */
+    private File canonical(File dir) {
+        try {
+            return dir.getCanonicalFile();
+        } catch (Throwable t) {
+            logLine("canonical path of " + dir.getAbsolutePath() + " failed: " + t);
+            return dir.getAbsoluteFile();
+        }
+    }
+
+    /**
+     * Whether the probe output contains a standalone "0".
+     *
+     * `su -c 'id -u'` prints "0" and nothing else, but a root manager wrapper is
+     * free to print a banner around it, so match the token instead of the line:
+     * strict enough that "uid=2000" or "10" never passes, loose enough that a
+     * chatty su does not turn a rooted phone into "not rooted".
+     */
+    private static boolean mentionsUidZero(String text) {
+        String trimmed = text.trim();
+        int start = 0;
+        while (start < trimmed.length()) {
+            int end = start;
+            while (end < trimmed.length() && !Character.isWhitespace(trimmed.charAt(end))) {
+                end++;
+            }
+            if (end > start && "0".equals(trimmed.substring(start, end))) {
+                return true;
+            }
+            start = end;
+            while (start < trimmed.length() && Character.isWhitespace(trimmed.charAt(start))) {
+                start++;
+            }
+        }
+        return false;
+    }
+
+    /** Read at most `max` bytes as UTF-8; the root probe prints two bytes. */
+    private static String readSmall(InputStream in, int max) {
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        byte[] chunk = new byte[64];
+        try {
+            int n;
+            while (buf.size() < max
+                    && (n = in.read(chunk, 0, Math.min(chunk.length, max - buf.size()))) > 0) {
+                buf.write(chunk, 0, n);
+            }
+        } catch (Throwable ignored) {
+            // a killed probe closes its pipe; whatever arrived is still evidence
+        }
+        try {
+            return buf.toString("UTF-8");
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private boolean rootProbed;
+    private boolean rootAvailable;
+
+    /**
+     * Whether this device really grants uid 0 right now.
+     *
+     * One `su -c id -u` per start, capped at two seconds: a not-rooted phone either
+     * has no `su` (sh exits 127 at once) or a root manager that pops a dialog and
+     * blocks, which is exactly the case the cap is for. The answer is cached, and
+     * logged either way -- the template's root section is derived from it, so a
+     * wrong answer here is visible in the log rather than in the agent's guesses.
+     */
+    private boolean hasRoot() {
+        if (rootProbed) {
+            return rootAvailable;
+        }
+        rootProbed = true;
+        rootAvailable = false;
+        Process p = null;
+        try {
+            p = new ProcessBuilder("/system/bin/sh", "-c", "su -c 'id -u'")
+                    .redirectErrorStream(true).start();
+            int rc = waitForExit(p, 2000);
+            if (rc < 0) {
+                logLine("root probe: no answer from su within 2s -> not rooted");
+                return false;
+            }
+            String out = readSmall(p.getInputStream(), 64).trim();
+            rootAvailable = rc == 0 && mentionsUidZero(out);
+            // one log line, always: a chatty su must not split the evidence
+            logLine("root probe: su -c id -u rc=" + rc
+                    + " out=" + (out.isEmpty() ? "(empty)" : out.replace('\n', ' '))
+                    + " -> " + (rootAvailable ? "rooted" : "not rooted"));
+        } catch (Throwable t) {
+            logLine("root probe: " + t + " -> not rooted");
+        } finally {
+            if (p != null) {
+                try {
+                    p.destroy();
+                } catch (Throwable ignored) {
+                    // already gone
+                }
+            }
+        }
+        return rootAvailable;
     }
 
     /** Write the instructions if they changed; log the path either way. */
@@ -1924,13 +2257,26 @@ public class NodeServer extends Service {
         } catch (Throwable ignored) {
             // no storage permission yet; the private home stays the workspace
         }
-        logLine("workspace: " + workspace.getAbsolutePath());
+        /*
+         * One spelling for both the session's cwd and its AGENTS.md.
+         *
+         * The harness derives the session cwd from process.cwd(), and getcwd(2)
+         * returns the resolved path: /sdcard/DSH inside this process is
+         * /storage/emulated/0/DSH inside the child. Java's File keeps whichever
+         * spelling it was given. Handing the child one spelling while writing its
+         * instructions under the other made the template describe a directory no
+         * session was in -- so canonicalize once, here, and use it everywhere.
+         */
+        File cwd = canonical(workspace);
+        logLine("workspace: " + cwd.getAbsolutePath()
+                + (cwd.getAbsolutePath().equals(workspace.getAbsolutePath())
+                ? "" : " (canonical of " + workspace.getAbsolutePath() + ")"));
         // Both layers in one line: a bug report should identify the app build and
         // the embedded harness without anyone having to ask.
         logLine("versions: app " + BuildConfig.APP_VERSION
                 + " · dsh " + BuildConfig.DSH_VERSION);
-        writeAgentInstructions(workspace);
-        pb.directory(workspace);
+        writeAgentInstructions(cwd);
+        pb.directory(cwd);
         Map<String, String> env = pb.environment();
         applyRuntimeEnv(env, prefixDir(), binDir(), home, tmp);
         env.put("NODE_ENV", "production");

@@ -45,6 +45,16 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     private Button probeButton;
     private Button storageButton;
     private Button rootButton;
+    /** Privilege routing line: one channel per capability, refreshed on resume. */
+    private TextView privilegeView;
+    /** Zero-install input channel row; tapping it opens the accessibility settings. */
+    private TextView a11yView;
+    /** Zero-install capture row; tapping it opens the system capture consent. */
+    private TextView projectionView;
+    private String lastPrivilegeLine;
+    private static final int SHIZUKU_REQUEST = 4201;
+    /** MediaProjection consent dialog: its result carries the capture token. */
+    private static final int REQUEST_PROJECTION = 4203;
     private Button resumeButton;
     private TextView logChip;
     /**
@@ -129,9 +139,34 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         // service) keeps it alive across WebView reloads.
         DeviceServer.setContext(this);
         DeviceServer.startOnce(getFilesDir());
-        if (new File(getFilesDir(), "root-granted").isFile()) {
-            reportRoot(false);
+        // Shizuku answers asynchronously: the binder may arrive after onCreate, and
+        // the user's allow/deny comes back through this listener, not onActivityResult.
+        try {
+            rikka.shizuku.Shizuku.addRequestPermissionResultListener(
+                    new rikka.shizuku.Shizuku.OnRequestPermissionResultListener() {
+                        @Override
+                        public void onRequestPermissionResult(int requestCode, int grantResult) {
+                            DeviceShell.onShizukuPermissionResult(requestCode, grantResult);
+                            runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    reportPrivilege(false);
+        // The probe runs off the UI thread (su can sit on a consent dialog), so the
+        // console line lands a moment later; refresh the label once it has.
+        getWindow().getDecorView().postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                updatePrivilegeView();
+            }
+        }, 3000);
+                                }
+                            });
+                        }
+                    });
+        } catch (Throwable t) {
+            logLine("shizuku: permission listener unavailable: " + t);
         }
+        reportPrivilege(false);
         if (Build.VERSION.SDK_INT >= 23) {
             requestPermissions(new String[]{
                     "android.permission.READ_EXTERNAL_STORAGE",
@@ -153,19 +188,124 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         }
     }
 
-    private void reportRoot(boolean interactive) {
-        // The bridge already probed root on its own thread, so this is a cheap
-        // read rather than another blocking su round trip on the UI thread. The
-        // root-granted marker records a previous successful grant; a marker
-        // without a live bridge means the grant was revoked, so clear it.
-        boolean root = DeviceServer.rootAvailable();
-        if (root) {
-            logLine("root: GRANTED (device bridge on 127.0.0.1:" + DeviceServer.currentPort() + ")");
-        } else if (new File(getFilesDir(), "root-granted").isFile()) {
-            logLine("root: marker present but bridge not root; clearing marker");
-            new File(getFilesDir(), "root-granted").delete();
+    /**
+     * Report the privilege routing: which backend serves capture, input and shell.
+     *
+     * `interactive` re-probes (an `su` probe can wait on a consent dialog), so the
+     * startup path only reads the cached routing. The old root-granted marker is
+     * kept in sync for older builds' benefit, but it no longer decides anything.
+     */
+    private void reportPrivilege(boolean interactive) {
+        if (interactive) {
+            DeviceShell.refresh(true);
+        }
+        String line = DeviceShell.line();
+        if (!line.equals(lastPrivilegeLine)) {
+            lastPrivilegeLine = line;
+            logLine(line);
+            logLine(getString(R.string.privilege_status, DeviceShell.label()));
+            if (!DeviceShell.isShizuku() && !DeviceShell.isRoot()) {
+                logLine("提示：" + DeviceShell.hint());
+            }
+        }
+        if (DeviceShell.isRoot()) {
+            try {
+                new File(getFilesDir(), "root-granted").createNewFile();
+            } catch (Throwable ignored) {
+            }
         } else {
-            logLine("root: not granted");
+            File marker = new File(getFilesDir(), "root-granted");
+            if (marker.isFile()) {
+                marker.delete();
+            }
+        }
+        updatePrivilegeView();
+    }
+
+    private void updatePrivilegeView() {
+        if (privilegeView != null) {
+            boolean ok = DeviceShell.isShizuku() || DeviceShell.isRoot()
+                    || DeviceShell.accessibilityOn();
+            // Two lines: what the input channel is, and the per-capability routing
+            // (`device: capture=... | input=... | shell=...`) the bug reports quote.
+            privilegeView.setText(getString(R.string.privilege_status, DeviceShell.label())
+                    + "\n" + DeviceShell.line());
+            privilegeView.setTextColor(ok ? theme.ok : theme.err);
+        }
+        updateRouteViews();
+    }
+
+    /** Refresh the accessibility / projection rows from their live state. */
+    private void updateRouteViews() {
+        if (a11yView != null) {
+            boolean on = DeviceShell.accessibilityOn();
+            a11yView.setText(getString(on ? R.string.accessibility_row_on
+                    : R.string.accessibility_row_off));
+            a11yView.setTextColor(on ? theme.ok : theme.warn);
+        }
+        if (projectionView != null) {
+            boolean on = DeviceShell.projectionOn();
+            if (on) {
+                String failure = ScreenProjection.error();
+                projectionView.setText(failure == null
+                        ? getString(R.string.projection_row_on)
+                        : getString(R.string.projection_row_on_failed, failure));
+            } else {
+                projectionView.setText(getString(R.string.projection_row_off));
+            }
+            projectionView.setTextColor(on ? theme.ok : theme.warn);
+        }
+    }
+
+    /** One clickable console row for a zero-install channel. */
+    private TextView routeRow() {
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (12 * d);
+        TextView row = new TextView(this);
+        row.setTextSize(13f);
+        row.setTextColor(theme.warn);
+        row.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x42000000, 14f));
+        row.setPadding(pad, pad, pad, pad);
+        row.setClickable(true);
+        row.setFocusable(true);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = (int) (10 * d);
+        row.setLayoutParams(lp);
+        row.setText("…");
+        return row;
+    }
+
+    /**
+     * Send the user to Settings -> Accessibility.
+     *
+     * There is no API to enable an AccessibilityService from inside the app: the
+     * switch is deliberately user-only, so the honest action is to open the screen
+     * it lives on.
+     */
+    private void openAccessibilitySettings() {
+        try {
+            startActivity(DshAccessibilityService.settingsIntent());
+            logLine("无障碍：已打开系统无障碍设置，找到「"
+                    + getString(R.string.accessibility_service_label) + "」并打开。");
+        } catch (Throwable t) {
+            logLine("无障碍：打不开系统设置（" + t + "），手动走 设置 → 无障碍 → 已安装的应用。");
+            statusView.setText("手动开：设置 → 无障碍 → 已安装的应用 → "
+                    + getString(R.string.accessibility_service_label));
+        }
+    }
+
+    /** Ask for the one-time screen-capture consent; the token is kept afterwards. */
+    private void requestProjection() {
+        android.content.Intent intent = ScreenProjection.requestIntent();
+        if (intent == null) {
+            logLine("投屏：" + ScreenProjection.error());
+            return;
+        }
+        try {
+            startActivityForResult(intent, REQUEST_PROJECTION);
+        } catch (Throwable t) {
+            logLine("投屏：启动授权失败（" + t + "）");
         }
     }
 
@@ -642,6 +782,39 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         statusView.setText(getString(R.string.starting_runtime));
         logPanel.addView(statusView, slp);
 
+        privilegeView = new TextView(this);
+        privilegeView.setTextSize(13f);
+        privilegeView.setTextColor(theme.warn);
+        privilegeView.setBackground(glassSurface((alpha(theme.card) & 0x00FFFFFF) | 0x42000000, 14f));
+        privilegeView.setPadding(sp, sp, sp, sp);
+        privilegeView.setText(getString(R.string.privilege_status, DeviceShell.label())
+                + "\n" + DeviceShell.hint());
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        plp.bottomMargin = (int) (16 * d);
+        logPanel.addView(privilegeView, plp);
+
+        // The two zero-install channels. Each row *is* the button: one tap takes
+        // the user to the exact system screen that turns it on, because the app
+        // cannot grant either of them itself.
+        a11yView = routeRow();
+        a11yView.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openAccessibilitySettings();
+            }
+        });
+        logPanel.addView(a11yView);
+
+        projectionView = routeRow();
+        projectionView.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                requestProjection();
+            }
+        });
+        logPanel.addView(projectionView);
+
         resumeButton = action(getString(R.string.back_to_app), true);
         resumeButton.setVisibility(View.GONE);
         resumeButton.setOnClickListener(new View.OnClickListener() {
@@ -661,13 +834,24 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         });
         logPanel.addView(bgButton);
 
-        rootButton = action(getString(R.string.grant_root_access), false);
+        rootButton = action(getString(R.string.privilege_channel_button), false);
         rootButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                logLine("root status: bridge=" + DeviceServer.currentPort()
-                        + " root=" + DeviceServer.rootAvailable());
-                reportRoot(true);
+                logLine(DeviceShell.requestShizukuPermission(SHIZUKU_REQUEST));
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        // Re-probe off the UI thread: a root grant can block on a dialog.
+                        DeviceShell.refresh(true);
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                reportPrivilege(false);
+                            }
+                        });
+                    }
+                }, "dsh-privilege").start();
             }
         });
         logPanel.addView(rootButton);
@@ -767,8 +951,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
         // a chip that brings the log back while the UI is on screen
         logChip = new TextView(this);
-        logChip.setText(getString(R.string.log));
-        logChip.setTextSize(13f);
+        logChip.setText(getString(R.string.console));
+        logChip.setTextSize(11f);
+        logChip.setAlpha(0.75f);
         logChip.setTextColor(theme.text);
         logChip.setBackground(plate(alpha(theme.card), 20f));
         int cp = (int) (14 * d);
@@ -776,16 +961,31 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         logChip.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                showLog();
+                /*
+                 * The only way back to the console.
+                 *
+                 * Gesture navigation does fire back, and the back key is handled
+                 * above, but an invisible gesture is not a discoverable exit: this
+                 * chip floats over the GUI and says what it does. The log panel it
+                 * used to toggle lives inside the console anyway.
+                 */
+                detachWeb();
             }
         });
         FrameLayout.LayoutParams chipLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        chipLp.gravity = android.view.Gravity.TOP | android.view.Gravity.END;
-        chipLp.topMargin = (int) (10 * d);
-        chipLp.rightMargin = (int) (10 * d);
+        /* Bottom-left, small: anything at the top or the right sits on top of the
+         * GUI's own controls (send button, header actions). */
+        chipLp.gravity = android.view.Gravity.BOTTOM | android.view.Gravity.START;
+        chipLp.bottomMargin = (int) (14 * d);
+        chipLp.leftMargin = (int) (12 * d);
+        /*
+         * No console chip. It overlapped the GUI's own controls wherever it was put
+         * (top-right sits on the header, bottom-left sits on the composer), and a
+         * control that covers the thing you are working in costs more than it gives.
+         * The back gesture already returns to the console -- see dispatchKeyEvent.
+         */
         logChip.setVisibility(View.GONE);
-        root.addView(logChip, chipLp);
 
         setContentView(root);
     }
@@ -871,6 +1071,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     protected void onResume() {
         super.onResume();
         applyBackgroundIfNeeded();
+        // A grant may have landed while the app was in the background.
+        reportPrivilege(false);
+        updatePrivilegeView();
         /*
          * Coming back to the foreground is a view event, not a harness event.
          *
@@ -979,13 +1182,29 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     }
 
     /**
-     * White-screen self-heal: ask the page whether it booted.
+     * White-screen self-heal: ask the page whether it actually rendered.
      *
      * A blank console after a resume is the page never having loaded, and the
      * app had no way to notice -- it logged nothing and waited for the user to
-     * clear the app. The served document carries the boot manifest as
-     * `window.__DSH_BOOT__`; a WebView that never navigated cannot answer with
-     * it. One reload per resume, so a genuinely broken page cannot loop.
+     * clear the app.
+     *
+     * This probe used to ask for `window.__DSH_BOOT__`. That global is written
+     * by the served HTML itself (the shell injects it from the bundled
+     * `@deepseek-ai/dsh-client-modules`, so it exists even with no client
+     * plugins installed), and it therefore answers "boot" for any document that
+     * merely arrived -- including one whose client bundle never ran, which is
+     * exactly the white screen this probe exists to catch. Measured on a
+     * headless browser against DSH 0.2.1-rc.2: a page carrying the manifest with
+     * `<div id="root"></div>` and no client JS answered `boot ready=complete`,
+     * while the real page answered the same. The manifest says nothing about
+     * whether anything was drawn.
+     *
+     * So judge the rendered document instead. The shell always serves
+     * `<div id="root">`; the boot overlay (`[data-dsh-boot]`) or the mounted app
+     * fills it with element children within ~150ms of the client JS running, and
+     * never at all when that JS did not run. Empty root, or no root (what a
+     * WebView that never navigated has: `about:blank`), is the failure. One
+     * reload per resume, so a genuinely broken page cannot loop.
      */
     private void checkPageReady() {
         if (diagnostics) {
@@ -1000,16 +1219,20 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         /*
          * A page that is still fetching is not the failure this probe looks for:
          * reloading it would restart a load that is going fine, and add back the
-         * race the handshake above exists to avoid. The page's own document says
-         * which it is -- `__DSH_BOOT__` is injected into the served HTML, so a
-         * document that finished loading without it is a blank console, while a
-         * document that reports `ready=loading` is simply not there yet.
+         * race the handshake above exists to avoid. The document answers for
+         * itself: `ready=loading` means the body is still being parsed, and
+         * `root=` counts the element children of the shell's mount point --
+         * 0 for a document that arrived but never rendered, >0 once the boot
+         * overlay or the app is in it, `none` when there is no such element at
+         * all (about:blank, an error page).
          */
         try {
             web.evaluateJavascript(
-                    "(function(){try{return (window.__DSH_BOOT__?\"boot\":\"noboot\")"
-                    + "+\" ready=\"+(document.readyState||\"?\")"
-                    + "+\" nodes=\"+(document.body?document.body.childElementCount:-1);}"
+                    "(function(){try{var r=document.getElementById(\"root\");"
+                    + "return \"root=\"+(r?r.childElementCount:\"none\")"
+                    + "+\" boot=\"+document.querySelectorAll(\"[data-dsh-boot]\").length"
+                    + "+\" html=\"+(r?r.innerHTML.length:-1)"
+                    + "+\" ready=\"+(document.readyState||\"?\");}"
                     + "catch(e){return \"err:\"+e;}})()",
                     new android.webkit.ValueCallback<String>() {
                         @Override
@@ -1025,22 +1248,50 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     private void onPageReadyProbe(String value) {
         String answer = value == null ? "null" : value.replace("\"", "").replace("\\", "");
         logLine("web[ready] probe " + answer + " at=" + stamp());
-        if (answer.startsWith("boot")) {
+        if (answer.contains("ready=loading")) {
+            logLine("web[ready] the document is still loading; not reloading it");
+            return;
+        }
+        int rootChildren = probeInt(answer, "root=");
+        if (rootChildren > 0) {
+            logLine("web[ready] the page rendered (" + probeInt(answer, "html=")
+                    + " bytes in #root); not reloading");
             return;
         }
         if (webReloadTried) {
             logLine("web[reload] the page is still blank after the reload; not retrying");
             return;
         }
-        if (answer.contains("ready=loading")) {
-            logLine("web[ready] the document is still loading; not reloading it");
-            return;
-        }
         webReloadTried = true;
         if (webAttached && web != null) {
             web.reload();
-            logLine("web[reload] no boot manifest " + (PAGE_READY_DELAY_MS / 1000)
+            logLine("web[reload] #root " + (rootChildren < 0 ? "is missing" : "is empty")
+                    + " " + (PAGE_READY_DELAY_MS / 1000)
                     + "s after resume; reloaded once");
+        }
+    }
+
+    /**
+     * Read one integer field out of the probe's answer (`root=3`, `html=22841`).
+     * Returns -1 when the field is absent or not a number (`root=none`).
+     */
+    private static int probeInt(String answer, String key) {
+        int at = answer.indexOf(key);
+        if (at < 0) {
+            return -1;
+        }
+        int i = at + key.length();
+        int end = i;
+        while (end < answer.length() && Character.isDigit(answer.charAt(end))) {
+            end++;
+        }
+        if (end == i) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(answer.substring(i, end));
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 
@@ -1065,13 +1316,14 @@ public class MainActivity extends Activity implements NodeServer.Listener {
      *
      * A failed request hands the app no content type -- `onReceivedError` reports
      * an error code, not a response -- so the endpoint has to be recognised by
-     * URL. Both patterns are the ones this app has measured failing from the
-     * reload race: the boot animation's media stream and the plugin event stream
-     * (`/plugins/events` is an EventSource, which reconnects by itself).
+     * URL. The measured one is the plugin event stream (`/plugins/events` is an
+     * EventSource, which reconnects by itself) plus any media the page itself
+     * streams; those are retried by the client, so counting them as app failures
+     * would reload a page that is fine.
      */
     private static boolean retryableResource(String url) {
         String lower = url.toLowerCase(java.util.Locale.US);
-        if (lower.contains("/dsh-boot-animation/media/") || lower.contains("/plugins/events")) {
+        if (lower.contains("/plugins/events")) {
             return true;
         }
         int query = lower.indexOf('?');
@@ -1232,7 +1484,65 @@ public class MainActivity extends Activity implements NodeServer.Listener {
         if (Build.VERSION.SDK_INT >= 21) {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
+        /*
+         * The account sign-in button calls window.open("about:blank") and then points
+         * that popup at the platform's authorize URL. A WebView without multi-window
+         * support silently drops the popup, which is why the button opened a blank
+         * page. Enable popups and hand the first URL they request to the system
+         * browser -- OAuth needs real cookies and a real redirect back.
+         */
+        web.getSettings().setSupportMultipleWindows(true);
+        web.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
+        web.setWebChromeClient(new android.webkit.WebChromeClient() {
+            @Override
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
+                final WebView probe = new WebView(MainActivity.this);
+                probe.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                        try {
+                            logLine("sign-in popup -> system browser: " + url);
+                            startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+                        } catch (Throwable t) {
+                            logLine("cannot open sign-in externally: " + t);
+                        }
+                        probe.destroy();
+                        return true;
+                    }
+                });
+                ((android.webkit.WebView.WebViewTransport) resultMsg.obj).setWebView(probe);
+                resultMsg.sendToTarget();
+                return true;
+            }
+        });
         web.setWebViewClient(new WebViewClient() {
+            /**
+             * Hand anything that is not this app's own page to the system browser.
+             *
+             * The GUI is entirely on 127.0.0.1, so an off-device navigation is the
+             * sign-in flow (or a documentation link). Rendering it inside this
+             * WebView showed a blank page -- sign-in needs the real browser, its
+             * cookies and its redirect back.
+             */
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                if (url == null) {
+                    return false;
+                }
+                boolean local = url.startsWith("http://127.0.0.1") || url.startsWith("http://localhost")
+                        || url.startsWith("file://") || url.startsWith("about:");
+                if (!local) {
+                    try {
+                        logLine("opening outside the app: " + url);
+                        startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+                    } catch (Throwable t) {
+                        logLine("cannot open externally: " + t);
+                    }
+                    return true;
+                }
+                return false;
+            }
+
             /**
              * One page load, one set of failure counts.
              *
@@ -1553,6 +1863,15 @@ public class MainActivity extends Activity implements NodeServer.Listener {
 
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
+        if (request == REQUEST_PROJECTION) {
+            // The consent Intent is the only thing this dialog produces, and it is
+            // single-use on Android 14+: ScreenProjection keeps the resulting
+            // projection alive so later screenshots do not re-prompt.
+            String message = ScreenProjection.onConsentResult(result, data);
+            logLine("投屏：" + message);
+            reportPrivilege(false);
+            return;
+        }
         if (request == REQUEST_BACKGROUND) {
             if (result == RESULT_OK) {
                 applyBackground(data);
@@ -1677,6 +1996,89 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             } catch (IOException ignored) {
             }
         }
+    }
+
+    /**
+     * Leave the GUI before leaving the app.
+     *
+     * The console is the only place with 复制日志 / 换背景图 / 环境自检, and the GUI
+     * is loaded over it automatically on resume -- so without this there was no way
+     * back to the console once the console had been covered, which also meant the
+     * one screen that can export the log became unreachable exactly when the log
+     * matters. Back inside the page goes back inside the page; back on the page's
+     * first page returns to the console.
+     */
+    /**
+     * Catch back before anyone else can.
+     *
+     * onBackPressed was not being reached at all here: the gesture produces a back
+     * key event, it is consumed further down (the WebView's own handling), and the
+     * app closed. Dispatch is the earliest Java-level point in the window, so this
+     * is where "back means leave the page, not the app" has to live.
+     */
+    @Override
+    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if (event.getKeyCode() == android.view.KeyEvent.KEYCODE_BACK) {
+            if (event.getAction() == android.view.KeyEvent.ACTION_UP && !event.isCanceled()) {
+                onBackPressed();
+            }
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public void onBackPressed() {
+        /*
+         * Back never closes the app while a page is on screen.
+         *
+         * The previous version keyed off the webAttached flag, which is not the same
+         * thing as "the page is showing": on the path that resumes into the GUI the
+         * flag can still be false, and then back fell through to the system handler
+         * and closed the app -- from the screen the user was trying to leave. Ask the
+         * view hierarchy instead: if the WebView has a parent, it is on screen.
+         */
+        if (web != null && web.getParent() != null) {
+            if (web.canGoBack()) {
+                web.goBack();
+                return;
+            }
+            detachWeb();
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastBackAt < 2000) {
+            super.onBackPressed();
+            return;
+        }
+        lastBackAt = now;
+        android.widget.Toast.makeText(this, "再按一次退出；右上角「控制台」可随时回来", android.widget.Toast.LENGTH_SHORT).show();
+    }
+
+    /** When the console last saw a back press, for the double-press exit. */
+    private long lastBackAt;
+
+    /** Take the GUI down and show the console that was underneath it. */
+    private void detachWeb() {
+        if (web != null) {
+            try {
+                android.view.ViewGroup parent = (android.view.ViewGroup) web.getParent();
+                if (parent != null) {
+                    parent.removeView(web);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        webAttached = false;
+        webAttachedAt = 0;
+        pageCheckUrl = null;
+        if (logPanel != null) {
+            logPanel.setVisibility(android.view.View.VISIBLE);
+        }
+        if (logChip != null) {
+            logChip.setVisibility(android.view.View.GONE);
+        }
+        logLine("left the GUI; the console is showing (press back again to exit)");
     }
 
     @Override

@@ -19,9 +19,9 @@ import java.util.Map;
  *
  * Why it lives in the app: capturing the framebuffer and injecting events need
  * CAPTURE_VIDEO_OUTPUT / INJECT_EVENTS, which are signature-level permissions an
- * ordinary app can never hold. This device is rooted and the user has already
- * granted the app root, so the bridge shells out through /system/bin/su -- the
- * same channel MainActivity.probeRoot() uses.
+ * ordinary app can never hold. The work is delegated to DeviceShell, which routes
+ * each capability to Shizuku (adb shell uid 2000, no root needed), to `su`, or to
+ * a refusal with instructions -- see that class for the routing table.
  *
  * Security posture: bound to 127.0.0.1, token-authenticated, and every argument is strictly
  * validated so no shell metacharacter reaches the command line, and there is
@@ -49,7 +49,6 @@ final class DeviceServer {
 
     private final File filesDir;
     private volatile int port = -1;
-    private volatile boolean rootOk = false;
     private final String token;
 
     private DeviceServer(File filesDir) {
@@ -73,8 +72,7 @@ final class DeviceServer {
     }
 
     static boolean rootAvailable() {
-        DeviceServer server = instance;
-        return server != null && server.rootOk;
+        return DeviceShell.isRoot();
     }
 
     private void start() {
@@ -86,10 +84,11 @@ final class DeviceServer {
                     try {
                         server = new ServerSocket(candidate, 8, InetAddress.getByName("127.0.0.1"));
                         port = candidate;
-                        rootOk = probeRoot();
-                        Log.i(TAG, "device bridge on http://127.0.0.1:" + candidate + "/ root=" + rootOk);
+                        DeviceShell.init(appContext, filesDir);
+                        Log.i(TAG, "device bridge on http://127.0.0.1:" + candidate + "/");
                         DiagnosticServer.appendLog(filesDir,
-                                "device bridge: http://127.0.0.1:" + candidate + "/ root=" + rootOk);
+                                "device bridge: http://127.0.0.1:" + candidate + "/" + " | "
+                                        + DeviceShell.line());
                         serve(server);
                         return;
                     } catch (Throwable inUse) {
@@ -107,11 +106,6 @@ final class DeviceServer {
         }, "dsh-device");
         thread.setDaemon(true);
         thread.start();
-    }
-
-    private boolean probeRoot() {
-        Shell shell = run(new String[]{"/system/bin/su", "-c", "id"}, 30000);
-        return shell.code == 0 && shell.text().contains("uid=0");
     }
 
     private void serve(ServerSocket server) {
@@ -356,21 +350,29 @@ final class DeviceServer {
             } else if (path.equals("/device/shot")) {
                 shot(socket, req.query);
             } else if (path.equals("/device/tap")) {
-                simple(socket, su("input", "tap", num(req, "x"), num(req, "y")));
+                simple(socket, DeviceShell.tap(Integer.parseInt(num(req, "x")),
+                        Integer.parseInt(num(req, "y"))));
             } else if (path.equals("/device/swipe")) {
-                simple(socket, su("input", "swipe", num(req, "x1"), num(req, "y1"),
-                        num(req, "x2"), num(req, "y2"), duration(req)));
+                simple(socket, DeviceShell.swipe(Integer.parseInt(num(req, "x1")),
+                        Integer.parseInt(num(req, "y1")), Integer.parseInt(num(req, "x2")),
+                        Integer.parseInt(num(req, "y2")), Integer.parseInt(duration(req))));
             } else if (path.equals("/device/key")) {
-                simple(socket, su("input", "keyevent", keyArg(req)));
+                simple(socket, DeviceShell.key(keyArg(req)));
             } else if (path.equals("/device/text")) {
-                simple(socket, su("input", "text", textArg(req)));
+                simple(socket, DeviceShell.text(textArg(req)));
+            } else if (path.equals("/device/ui")) {
+                simple(socket, DeviceShell.readUi(uiLimit(req)));
+            } else if (path.equals("/device/route")) {
+                route(socket, req);
             } else if (path.equals("/device/start")) {
-                simple(socket, su("am", "start", "-n", componentArg(req)));
+                simple(socket, DeviceShell.exec("am start -n " + componentArg(req), 60000));
+            } else if (path.equals("/device/shell")) {
+                shell(socket, req.query);
             } else if (path.equals("/device/ocr")) {
                 ocr(socket, req.query);
             } else if (path.equals("/device/top")) {
-                simple(socket, su("sh", "-c",
-                        "dumpsys activity activities | grep -m1 topResumedActivity"));
+                simple(socket, DeviceShell.exec(
+                        "dumpsys activity activities | grep -m1 topResumedActivity", 30000));
             } else {
                 send(socket, 404, "text/plain; charset=utf-8",
                         "unknown endpoint\n".getBytes("UTF-8"));
@@ -389,14 +391,25 @@ final class DeviceServer {
         StringBuilder sb = new StringBuilder();
         sb.append("dsh device bridge\n");
         sb.append("port: ").append(port).append('\n');
-        sb.append("root: ").append(rootOk).append('\n');
+        // One line per route, so a bug report says which channel each capability
+        // actually took instead of guessing from the presence of root.
+        sb.append(DeviceShell.line()).append('\n');
+        sb.append("device shell: ").append(DeviceShell.isShizuku() ? "Shizuku"
+                : DeviceShell.isRoot() ? "su" : "none").append('\n');
+        for (String channel : DeviceShell.channels()) {
+            sb.append("  ").append(channel).append('\n');
+        }
         sb.append("endpoints:\n");
         sb.append("  GET /device/shot[?out=NAME]                PNG bytes of the current screen\n");
         sb.append("  GET /device/tap?x=&y=                      inject a tap\n");
         sb.append("  GET /device/swipe?x1=&y1=&x2=&y2=[&ms=]    inject a swipe\n");
         sb.append("  GET /device/key?name=home|back|enter|volup|voldown|power|CODE\n");
-        sb.append("  GET /device/text?value=...                 type text\n");
+        sb.append("  GET /device/text?value=...                 type text (Unicode via accessibility)\n");
+        sb.append("  GET /device/ui[?max=60]                    readable node-tree summary (accessibility)\n");
+        sb.append("  GET /device/route[?pin=a11y|projection|su|none|auto]  pin the routing (tests)\n");
         sb.append("  GET /device/start?component=pkg/.Act       launch an activity\n");
+        sb.append("  GET /device/shell?cmd=[&timeout=SEC]       run a whitelisted command line\n");
+        sb.append("                                             (raw stdout, X-Exit-Code header)\n");
         sb.append("  GET /device/top                            current foreground activity\n");
         sb.append("  GET /device/ocr[?lang=chi_sim+eng]         OCR the screen (needs OCR runtime)\n");
         sb.append("  GET /device/status                         this text\n");
@@ -405,21 +418,25 @@ final class DeviceServer {
 
     /** Capture the screen and return raw PNG bytes so callers need no decoder. */
     private void shot(Socket socket, Map<String, String> query) throws Exception {
+        // `screencap -p` writes to stdout, not to a file: under Shizuku the process
+        // runs as uid 2000 and cannot write this app's private directory, while a
+        // file-writing variant would work only for root. The app writes the file.
+        DeviceShell.Result capture = DeviceShell.capture();
+        if (!capture.ok() || capture.out.length == 0) {
+            send(socket, 500, "text/plain; charset=utf-8",
+                    ("capture failed: " + capture.text() + "\n").getBytes("UTF-8"));
+            return;
+        }
         File out = new File(filesDir, "screen.png");
         String named = query.get("out");
         if (named != null && named.matches("[A-Za-z0-9_.-]{1,64}")) {
             out = new File(filesDir, named);
         }
-        // Writing into the app's private dir avoids scoped-storage problems. No -d
-        // is passed: the display id is not stable across reconnects on this device.
-        Shell shell = run(new String[]{"/system/bin/su", "-c",
-                "screencap -p " + shellQuote(out.getAbsolutePath())}, 45000);
-        if (!out.isFile() || out.length() == 0) {
-            send(socket, 500, "text/plain; charset=utf-8",
-                    ("capture failed: " + shell.text() + "\n").getBytes("UTF-8"));
-            return;
-        }
-        send(socket, 200, "image/png", readFile(out, MAX_BODY));
+        writeBytes(out, capture.out);
+        Map<String, String> headers = new HashMap<String, String>();
+        headers.put("X-Device-Backend", capture.backend == null ? "?" : capture.backend);
+        headers.put("X-Png-Bytes", String.valueOf(capture.out.length));
+        send(socket, 200, "image/png", capture.out, headers);
     }
 
     /**
@@ -432,23 +449,82 @@ final class DeviceServer {
         if (lang == null || !lang.matches("[a-z_+]{1,64}")) {
             lang = "chi_sim+eng";
         }
-        File shot = new File(filesDir, "screen.png");
-        run(new String[]{"/system/bin/su", "-c",
-                "screencap -p " + shellQuote(shot.getAbsolutePath())}, 45000);
-        if (!shot.isFile() || shot.length() == 0) {
-            send(socket, 500, "text/plain; charset=utf-8", "capture failed\n".getBytes("UTF-8"));
+        DeviceShell.Result capture = DeviceShell.capture();
+        if (!capture.ok() || capture.out.length == 0) {
+            send(socket, 500, "text/plain; charset=utf-8",
+                    ("capture failed: " + capture.text() + "\n").getBytes("UTF-8"));
             return;
         }
-        File scriptFile = new File(filesDir, "ocr.sh");
+        // The OCR side runs in a shell, so the image has to live somewhere that uid
+        // can read. Root can read the private dir; Shizuku (uid 2000) cannot, so use
+        // the app's external files dir, which shell can read on every release.
+        File dir = ocrWorkDir();
+        File shot = new File(dir, "screen.png");
+        writeBytes(shot, capture.out);
+        File scriptFile = new File(dir, "ocr.sh");
         writeFile(scriptFile, ocrScript(shot, lang));
-        Shell shell = run(new String[]{"/system/bin/su", "-c",
-                "sh " + shellQuote(scriptFile.getAbsolutePath())}, 120000);
+        DeviceShell.Result shell = DeviceShell.exec(
+                "sh " + shellQuote(scriptFile.getAbsolutePath()), 120000);
         String text = shell.text();
         if (text.startsWith("OCR_RUNTIME_MISSING")) {
             send(socket, 501, "text/plain; charset=utf-8", text.getBytes("UTF-8"));
             return;
         }
         send(socket, 200, "text/plain; charset=utf-8", text.getBytes("UTF-8"));
+    }
+
+    /**
+     * A directory the privileged shell can read.
+     *
+     * Root (`su`) reads the private dir fine. Shizuku runs as uid 2000, which is
+     * denied on /data/data/<pkg> but allowed on the app's external files dir, so
+     * that is used whenever the external volume is mounted.
+     */
+    private File ocrWorkDir() {
+        if (!DeviceShell.isRoot()) {
+            File external = appContext == null ? null : appContext.getExternalFilesDir("ocr");
+            if (external != null && (external.isDirectory() || external.mkdirs())) {
+                return external;
+            }
+        }
+        return filesDir;
+    }
+
+    /**
+     * Write bytes without assuming the target is writable.
+     *
+     * An upgraded install can still have a `screen.png` owned by root: every
+     * previous build captured through `su`, so the file it left behind is root:600
+     * and the app cannot reopen it (EACCES). Writing a sibling temp file and
+     * renaming it into place only needs write permission on the directory, which
+     * the app always has; if rename still fails, drop the old file first.
+     */
+    private static void writeBytes(File file, byte[] data) throws Exception {
+        File parent = file.getParentFile();
+        if (parent != null && !parent.isDirectory()) {
+            parent.mkdirs();
+        }
+        File tmp = new File(parent, file.getName() + ".tmp-"
+                + android.os.Process.myPid() + "-" + System.nanoTime());
+        java.io.FileOutputStream out = new java.io.FileOutputStream(tmp);
+        try {
+            out.write(data);
+        } finally {
+            out.close();
+        }
+        if (tmp.renameTo(file)) {
+            return;
+        }
+        file.delete();
+        if (!tmp.renameTo(file)) {
+            java.io.FileOutputStream direct = new java.io.FileOutputStream(file);
+            try {
+                direct.write(data);
+            } finally {
+                direct.close();
+            }
+            tmp.delete();
+        }
     }
 
     /**
@@ -475,100 +551,105 @@ final class DeviceServer {
 
     // ------------------------------------------------------------------- shell
 
-    private static final class Shell {
-        int code;
-        byte[] out = new byte[0];
-        byte[] err = new byte[0];
-
-        String text() {
-            String o = new String(out, 0, out.length);
-            String e = new String(err, 0, err.length);
-            if (o.length() == 0) {
-                return e;
-            }
-            return e.length() == 0 ? o : o + "\n" + e;
+    /**
+     * Run one whitelisted command line through the routing table.
+     *
+     * Response shape: stdout is the body, exit code is X-Exit-Code, stderr is
+     * X-Stderr-B64 (base64, because a header cannot carry newlines or NULs). This
+     * is what the screen-operate plugin calls instead of `su -c`; the privilege
+     * decision is made here, once, and the plugin never knows which one ran.
+     */
+    private void shell(Socket socket, Map<String, String> query) throws Exception {
+        String command = shellCommand(query.get("cmd"));
+        long timeoutMs = 60000;
+        String timeout = query.get("timeout");
+        if (timeout != null && timeout.matches("[0-9]{1,3}")) {
+            timeoutMs = Math.max(1, Math.min(120, Integer.parseInt(timeout))) * 1000L;
         }
+        DeviceShell.Result result = DeviceShell.exec(command, timeoutMs);
+        if (result.failure != null) {
+            // Never answer 200 with an empty body for a command that never ran: the
+            // caller would report "exit 1, 0 bytes" and lose the reason (NO_PRIVILEGE,
+            // timeout, spawn failure). 503 + the message is what surfaces in the tool.
+            send(socket, 503, "text/plain; charset=utf-8",
+                    (result.failure + "\n").getBytes("UTF-8"));
+            return;
+        }
+        String stderr = result.errText();
+        if (stderr.length() > 4000) {
+            stderr = stderr.substring(0, 4000);
+        }
+        Map<String, String> headers = new HashMap<String, String>();
+        headers.put("X-Exit-Code", String.valueOf(result.code));
+        headers.put("X-Device-Shell", result.backend);
+        headers.put("X-Stderr-B64", android.util.Base64.encodeToString(
+                stderr.getBytes("UTF-8"), android.util.Base64.NO_WRAP));
+        send(socket, 200, "application/octet-stream", result.out, headers);
     }
 
     /**
-     * Run argv with a hard deadline. The array goes straight to exec, so nothing
-     * reaches a shell unless the caller explicitly asked for one.
+     * Commands this endpoint will run. The bridge used to expose only fixed
+     * operations and no command runner; the plugin needs the same command strings
+     * it used to send to `su -c` (pipes to grep included), so the check is on the
+     * first program, not on the whole line.
+     *
+     * Access is unchanged from the su channel it replaces: loopback only, browser
+     * origins refused, per-install token required, and the caller is the app's own
+     * runtime. Anything outside this list is rejected instead of executed.
      */
-    private static Shell run(String[] argv, long timeoutMs) {
-        Shell result = new Shell();
-        Process p = null;
-        try {
-            p = new ProcessBuilder(argv).start();
-            final Process proc = p;
-            final ByteArrayOutputStream out = new ByteArrayOutputStream();
-            final ByteArrayOutputStream err = new ByteArrayOutputStream();
-            Thread to = pump(proc.getInputStream(), out);
-            Thread te = pump(proc.getErrorStream(), err);
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            while (System.currentTimeMillis() < deadline) {
-                try {
-                    result.code = proc.exitValue();
-                    break;
-                } catch (IllegalThreadStateException alive) {
-                    Thread.sleep(40);
-                }
-            }
-            if (p.isAlive()) {
-                p.destroy();
-                result.code = -1;
-            } else {
-                result.code = p.exitValue();
-            }
-            to.join(2000);
-            te.join(2000);
-            result.out = out.toByteArray();
-            result.err = err.toByteArray();
-        } catch (Throwable t) {
-            result.code = -2;
-            result.err = ("spawn failed: " + t).getBytes();
-        } finally {
-            if (p != null) {
-                p.destroy();
-            }
+    private static final java.util.Set<String> SHELL_ALLOWED = new java.util.HashSet<String>(
+            java.util.Arrays.asList("screencap", "input", "wm", "dumpsys", "am", "cmd",
+                    "pm", "settings", "getprop", "id", "uiautomator", "ls", "cat", "ps",
+                    "date", "df", "top", "pidof", "dumpsys"));
+
+    private static String shellCommand(String cmd) throws BadRequest {
+        if (cmd == null || cmd.trim().isEmpty()) {
+            throw new BadRequest("missing 'cmd'");
         }
-        return result;
+        if (cmd.length() > 8192) {
+            throw new BadRequest("'cmd' too long");
+        }
+        if (cmd.indexOf('\0') >= 0) {
+            throw new BadRequest("NUL in 'cmd'");
+        }
+        String first = cmd.trim().split("\\s+")[0];
+        String program = first.substring(first.lastIndexOf('/') + 1);
+        if (!SHELL_ALLOWED.contains(program)) {
+            throw new BadRequest("command not allowed: " + program);
+        }
+        return cmd;
     }
 
-    private static Thread pump(final InputStream in, final ByteArrayOutputStream into) {
-        Thread t = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                byte[] buf = new byte[8192];
-                try {
-                    int n;
-                    while ((n = in.read(buf)) > 0) {
-                        into.write(buf, 0, n);
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-        }, "dsh-pump");
-        t.setDaemon(true);
-        t.start();
-        return t;
+    private void simple(Socket socket, DeviceShell.Result result) throws Exception {
+        String body = "code=" + result.code + "\n" + result.text();
+        // Which channel actually served this call. The routing line in
+        // /device/status says what *would* be used; this says what did, which is
+        // the only way to prove a tap really went through accessibility.
+        Map<String, String> headers = new HashMap<String, String>();
+        headers.put("X-Device-Backend", result.backend == null ? "?" : result.backend);
+        send(socket, result.code == 0 ? 200 : 500, "text/plain; charset=utf-8",
+                body.getBytes("UTF-8"), headers);
     }
 
-    /** Join already-validated arguments into one `su -c` command line. */
-    private static Shell su(String... args) {
+    /**
+     * Pin the routing table for a test run: `?pin=accessibility` allows only the
+     * accessibility channel, `?pin=none` allows none, `?pin=auto` clears it.
+     *
+     * The pin lives in memory and can only remove candidates, never add one, so it
+     * cannot be used to gain access the app did not already have. It exists because
+     * the four channel states (zero-install / projection / Shizuku / root / none)
+     * otherwise cannot be exercised on a phone that happens to have root.
+     */
+    private void route(Socket socket, Request req) throws Exception {
+        String pin = req.query.get("pin");
+        String line = DeviceShell.setPin(pin);
         StringBuilder sb = new StringBuilder();
-        for (String a : args) {
-            if (sb.length() > 0) {
-                sb.append(' ');
-            }
-            sb.append(a);
+        sb.append("pin: ").append(pin == null ? "auto" : pin).append('\n');
+        sb.append(line).append('\n');
+        for (String channel : DeviceShell.channels()) {
+            sb.append("  ").append(channel).append('\n');
         }
-        return run(new String[]{"/system/bin/su", "-c", sb.toString()}, 60000);
-    }
-
-    private void simple(Socket socket, Shell shell) throws Exception {
-        String body = "code=" + shell.code + "\n" + shell.text();
-        send(socket, shell.code == 0 ? 200 : 500, "text/plain; charset=utf-8",
-                body.getBytes("UTF-8"));
+        send(socket, 200, "text/plain; charset=utf-8", sb.toString().getBytes("UTF-8"));
     }
 
     // -------------------------------------------------------------- validation
@@ -642,9 +723,12 @@ final class DeviceServer {
     }
 
     /**
-     * `input text` splits on spaces, so spaces become %s. Everything else is
-     * validated away rather than escaped, which keeps a crafted request from
-     * reaching the shell at all.
+     * Text for /device/text, passed through as written.
+     *
+     * Two channels consume it and only one needs escaping: ACTION_SET_TEXT takes
+     * Unicode directly (so Chinese finally works), while `input text` is built into
+     * a command line and escapes itself in DeviceShell.shellText(). Filtering here
+     * would throw away every non-ASCII character for both of them.
      */
     private static String textArg(Request req) throws BadRequest {
         String v = req.query.get("value");
@@ -654,22 +738,29 @@ final class DeviceServer {
         if (v.length() > 2000) {
             throw new BadRequest("'value' too long");
         }
-        StringBuilder sb = new StringBuilder();
+        if (v.isEmpty()) {
+            throw new BadRequest("'value' is empty");
+        }
         for (int i = 0; i < v.length(); i++) {
             char c = v.charAt(i);
-            if (c == ' ') {
-                sb.append("%s");
-            } else if (c == '%') {
-                sb.append("%%");
-            } else if (c > 0x20 && c < 0x7f && "\\'\"`$&|;<>(){}[]*?~!#\n".indexOf(c) < 0) {
-                sb.append(c);
+            if (c == 0 || c == '\n' || c == '\r') {
+                throw new BadRequest("'value' must be a single line");
             }
-            // Anything else is dropped: non-ASCII needs an IME, not `input`.
         }
-        if (sb.length() == 0) {
-            throw new BadRequest("no typeable ASCII in 'value'");
+        return v;
+    }
+
+    /** Node budget for /device/ui: small by default, because dumps end up in prompts. */
+    private static int uiLimit(Request req) throws BadRequest {
+        String v = req.query.get("max");
+        if (v == null) {
+            return 60;
         }
-        return sb.toString();
+        if (!v.matches("[0-9]{1,4}")) {
+            throw new BadRequest("invalid 'max'");
+        }
+        int n = Integer.parseInt(v);
+        return Math.max(1, Math.min(400, n));
     }
 
     private static String componentArg(Request req) throws BadRequest {
@@ -743,7 +834,13 @@ final class DeviceServer {
     }
 
     private static void send(Socket socket, int code, String type, byte[] body) throws Exception {
+        send(socket, code, type, body, null);
+    }
+
+    private static void send(Socket socket, int code, String type, byte[] body,
+                             Map<String, String> headers) throws Exception {
         String reason = code == 200 ? "OK" : code == 400 ? "Bad Request"
+                : code == 503 ? "Service Unavailable"
                 : code == 404 ? "Not Found" : code == 501 ? "Not Implemented"
                 : "Internal Server Error";
         OutputStream out = socket.getOutputStream();
@@ -752,6 +849,11 @@ final class DeviceServer {
         head.append("Content-Type: ").append(type).append("\r\n");
         head.append("Content-Length: ").append(body.length).append("\r\n");
         head.append("Cache-Control: no-store\r\n");
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                head.append(entry.getKey()).append(": ").append(entry.getValue()).append("\r\n");
+            }
+        }
         head.append("Connection: close\r\n\r\n");
         out.write(head.toString().getBytes("UTF-8"));
         out.write(body);

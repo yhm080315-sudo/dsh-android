@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dsh.android"
-    android:versionCode="10018"
-    android:versionName="1.0.18+dsh.0.2.0-rc.2">
+    android:versionCode="10019"
+    android:versionName="1.0.19+dsh.0.2.1-rc.2">
 
     <!-- targetSdk 28 keeps the pre-Android-10 exec-from-app-data policy that the
          bundled runtime depends on: the harness runs ELF binaries out of the
@@ -16,6 +16,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Declared by Shizuku's provider library. It lets the Shizuku manager hand
+         this app the privileged binder after the user authorises it; the app
+         itself does not need it for anything else. -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <!-- Shared-storage access so the harness can read and write the phone's files.
          READ/WRITE_EXTERNAL_STORAGE are the runtime permissions (granted in-app);
@@ -47,6 +51,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Shizuku's binder handshake. The manager queries this provider (it holds
+             INTERACT_ACROSS_USERS_FULL) and delivers the adb-shell binder here.
+             Without Shizuku installed the provider simply never receives a binder:
+             Shizuku.pingBinder() stays false and the app falls back to su/none. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.dsh.android.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
         <provider
             android:name=".FileBridge"
             android:authorities="com.dsh.android.files"
@@ -57,9 +72,31 @@
             android:authorities="com.dsh.android.updates"
             android:exported="false"
             android:grantUriPermissions="true" />
+        <!-- Shizuku v13 protocol marker (usually merged from the provider AAR;
+             this build has no AAR merging, so it is declared here). -->
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
+            android:value="true" />
         <service
             android:name=".NodeServer"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <!-- Zero-install input channel. The system binds this only after the user
+             turns it on in Settings -> Accessibility; until then the component is
+             just a declaration and every call answers NO_PRIVILEGE. It serves
+             tap/swipe/text/UI-reading only; screenshots need MediaProjection.
+             (XML comments cannot contain a double hyphen, so no dashes above.) -->
+        <service
+            android:name=".DshAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
     </application>
 </manifest>

@@ -99,13 +99,46 @@ MANIFEST="$WORK/AndroidManifest.xml"
     --min-sdk-version 24 --target-sdk-version 28 \
     "${RES_ARGS[@]+"${RES_ARGS[@]}"}"
 
+# Shizuku client library. There is no Gradle here, so the four AARs were unpacked
+# once and their classes.jar kept in app/libs; they go into javac's classpath and
+# into the dex. See docs/PITFALLS.md #17 for why the dex step is D8, not dx.
+LIB_JARS=()
+for jar in "$APP"/libs/shizuku-*.jar; do
+    [ -f "$jar" ] && LIB_JARS+=("$jar")
+done
+if [ ${#LIB_JARS[@]} -eq 0 ]; then
+    echo "no app/libs/shizuku-*.jar -- unpack dev.rikka.shizuku:{api,provider,aidl,shared}" >&2
+    echo "13.1.0 AARs and drop their classes.jar into app/libs/ (see docs/PITFALLS.md #17)" >&2
+    exit 1
+fi
+CLASSPATH_ALL="$PLATFORM_JAR"
+for jar in "${LIB_JARS[@]}"; do
+    CLASSPATH_ALL="$CLASSPATH_ALL:$jar"
+done
+
+# aapt2 writes R.java under $WORK/r (--java above); it must be compiled with the
+# app, or every getString(R.string.*) site fails to build.
 find "$APP/src" "$WORK/gen" "$WORK/r" -name '*.java' > "$WORK/sources.txt"
 javac -source 8 -target 8 -encoding UTF-8 -nowarn \
-      -bootclasspath "$PLATFORM_JAR" -classpath "$PLATFORM_JAR" \
+      -bootclasspath "$PLATFORM_JAR" -classpath "$CLASSPATH_ALL" \
       -d "$WORK/classes" @"$WORK/sources.txt"
 
-dalvik-exchange --dex --no-strict --min-sdk-version=24 \
-    --output="$WORK/dex/classes.dex" "$WORK/classes"
+# dx cannot translate Shizuku's Java 8 lambdas at minSdk 24 ("invalid opcode ba -
+# invokedynamic requires --min-sdk-version >= 26") and raising minSdk would drop
+# Android 7. D8 desugars them; it needs --lib and jars, not directories.
+( cd "$WORK/classes" && jar cf "$WORK/app-classes.jar" . )
+if [ -x "$BT/d8" ]; then
+    D8_CMD=("$BT/d8")
+elif [ -n "${R8_JAR:-}" ]; then
+    D8_CMD=(java -cp "$R8_JAR" com.android.tools.r8.D8)
+elif command -v d8 >/dev/null 2>&1; then
+    D8_CMD=(d8)
+else
+    echo "no d8 and no R8_JAR: dx rejects Shizuku's invokedynamic (docs/PITFALLS.md #17)" >&2
+    exit 1
+fi
+"${D8_CMD[@]}" --min-api "24" --lib "$PLATFORM_JAR" --output "$WORK/dex" \
+    "$WORK/app-classes.jar" "${LIB_JARS[@]}"
 
 cp "$WORK/base.apk" "$WORK/unsigned.apk"
 ( cd "$WORK/dex" && zip -q -X "$WORK/unsigned.apk" classes.dex )

@@ -4,7 +4,8 @@ English | [中文](README.md)
 
 Package [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) (DSH below) as a **standalone Android app**.
 
-Install one APK and start using it: **no Termux, no proot, no root, and no computer required**. The entire runtime (Node, bash, ripgrep, coreutils) is embedded in the APK.
+Install one APK and start using it: **no Termux, no proot, and no computer required**. The entire runtime (Node, bash, ripgrep, coreutils) is embedded in the APK.
+Device control (screen reading / taps / text input) needs an elevation channel: **Shizuku (recommended, no root) or root** — see “Device capabilities” below.
 
 > **Status**: Working. Verified on a Xiaomi 2509FPN0BC / Android 17 (screenshots, taps, file reads and writes, image uploads, and the plugin system all work).
 > **Tradeoff**: `targetSdk` must be 28, so the app **cannot be published on Google Play**. See [docs/en/PITFALLS.md](docs/en/PITFALLS.md) for the reasons.
@@ -15,7 +16,7 @@ Install one APK and start using it: **no Termux, no proot, no root, and no compu
 
 - **The WebView runs the actual DSH web interface**—built from the same source code, rather than a rewrite
 - The main interface, plugins, themes, and agents are all the same as on desktop
-- An additional built-in **device control interface** (screenshots / taps / swipes / text input / OCR / launching apps) runs through `su`
+- An additional built-in **device control interface** (screenshots / taps / swipes / text input / OCR / launching apps), routed per capability through Shizuku or `su`
 - Sessions, attachments, and credentials are stored in the app's private directory and survive upgrades
 - The **native startup console also supports custom colors and background images**; just edit a text file on the phone, with no need to rebuild the APK
 
@@ -186,7 +187,6 @@ resume with a different archive and it reads garbage, failing repeatedly on the 
 ---
 
 ## How this compares with other mobile approaches
-## How this compares with other mobile approaches
 
 There are currently two ways to run dsh on Android, each with its own costs. Explaining those costs is more useful than labeling one another—neither replaces the other;
 they simply put the costs in different places.
@@ -212,24 +212,32 @@ they must be located, reapplied, and verified again (`docs/en/PITFALLS.md` and t
 **If the goal is to keep up with upstream over the long term**, the container approach is easier in this situation;
 **if the goal is a smaller footprint, fast startup, and no dependency on root**, this project is a better fit.
 
-### Device capabilities: both approaches need elevated privileges
+### Device capabilities: Shizuku first, root second, neither means a clear error
 
-This project's device capabilities (screen reading, taps, notifications, clipboard, sensors) are exposed through interfaces provided by the app itself. The equivalent operations in the container approach
-usually call `su` directly—**but this is not a difference in whether root is required; both need it**:
+`screencap` and `input` can only be called by shell or root; an ordinary app cannot. `DeviceShell`
+inside the app picks its backend **per capability**, instead of having a single global channel:
 
 ```
-screencap    Only shell or root can call this; ordinary apps cannot
-input        Same as above
+capture  → Backend.capture()            screencap (currently: Shizuku / su)
+input    → Backend.tap/swipe/key/text   input (currently: Shizuku / su)
+shell    → Backend.exec()               arbitrary commands (only Shizuku / su can)
 ```
 
-This project's screen-operation plugin and device bridge currently use `su -c screencap` / `su -c input`.
-To eliminate the dependency on root, one of the following two approaches would be needed; **neither has been implemented in this project**:
+Priority: **Shizuku (authorised and the service running) → su/root → none (returns `NO_PRIVILEGE` with install/authorise instructions)**.
+The status line shows it at a glance, for example:
 
-- **Shizuku**: The user grants permission once to obtain adb-level privileges. `screencap` / `input` still work, without root.
-- **MediaProjection + an accessibility service**: Entirely at the app level, with separate one-time authorization for frame capture and input injection,
-  but injection is subject to accessibility restrictions, and frame capture requires an ongoing screen-capture session.
+```
+device: capture=screencap via Shizuku (adb uid=2000) | input=input via Shizuku (adb uid=2000) | shell=Shizuku (adb uid=2000)
+```
 
-In other words, **both approaches currently require elevated privileges**; the difference is the form of elevation and the steps the user must take.
+- **Shizuku**: the user taps allow once inside Shizuku, the app gets adb-level privileges, and `screencap` / `input`
+  keep working **without root**. The console's “Privilege channel (Shizuku / root)” button starts the request.
+- **root**: with root the app runs `su -c` directly, exactly as earlier versions did.
+- **neither**: screen/input calls fail outright, with an explicit `NO_PRIVILEGE` error that says where to install or
+  authorise Shizuku — it is never disguised as a different error.
+
+Later, **MediaProjection (frame capture) + an accessibility service (injection)** can be attached to the same interface:
+each only has to implement `capture()` or `tap/swipe/text()`, add one row to the routing table, and nothing above it or in the plugins changes.
 
 
 ## Why not use Termux
@@ -254,7 +262,7 @@ No. Android 10+'s W^X policy prevents apps from executing files they have writte
 `targetSdk ≤ 28` is the only permitted workaround. The tradeoff is that the app cannot be published on Google Play.
 
 **Q: Why is the APK so large?**
-It embeds the full Node.js runtime (45 MB), DSH and its 177 dependencies, plus a set of coreutils.
+It embeds the full Node.js runtime (45 MB), DSH and its dependencies, plus a set of coreutils.
 The extracted size is about 600 MB, so the first launch takes a few seconds to unpack it.
 
 **Q: Can iOS be supported?**
@@ -323,12 +331,35 @@ including the **symptoms, root cause, verification method, and fix** for every i
 ## License
 
 - **This project's code** (`app/`, `scripts/`, `patches/`, `tools/`): MIT; see [LICENSE](LICENSE)
-- **Embedded DSH**: MIT (`@deepseek-ai/dsh` and its 177 dependencies)
+- **Embedded DSH**: MIT (`@deepseek-ai/dsh` and its dependencies — about 568 package directories under `node_modules`)
 - **Embedded Termux binaries**: Their respective licenses, including **GPL** components (coreutils, bash, busybox)
-- See [THIRD-PARTY.md](THIRD-PARTY.md) for the third-party inventory and obligations
+- The inventory and obligations are in [THIRD-PARTY.md](THIRD-PARTY.md); the full text shipped inside the APK is
+  `THIRD-PARTY-NOTICES.md` (packed with the payload, so after installation it lives at
+  `files/runtime/THIRD-PARTY-NOTICES.md`, and the diagnostic page `http://127.0.0.1:3097/` prints it too)
 
-⚠️ **This repository contains no third-party plugins**. Theme plugins often have restrictive licenses
-(for example, the whale theme uses `CC-BY-NC-SA-4.0`, prohibiting commercial use and requiring ShareAlike). Evaluate the license yourself before installing.
+### Third-party plugins: the repository and the APK are two different things
+
+**(a) This repository contains no third-party plugin source.** `app/`, `patches/`, `scripts/` and `tools/` hold only
+this project's own MIT code; plugins are not committed here.
+
+**(b) But the released APK does ship two plugins**, packed with the payload (`assets/runtime.tar.gz`); their source is not in this repository:
+
+| Plugin in the APK | License | Purpose / notes |
+|---|---|---|
+| `dsh-screen-operate` 0.1.5 | **not declared — pending the author's confirmation** | On-device screen reading and control, a core feature. `package.json` has no `license` field and the package carries no `LICENSE`; until the author gives explicit permission this is not a redistribution grant |
+| ~~`dsh-boot-animation` 0.4.2~~ | ~~BSD-3-Clause~~ | Intro animation, purely decorative. **Removed from the payload as of 1.0.19-beta16** (by request). The white-screen self-healing probe was thought to depend on the `window.__DSH_BOOT__` it injected; in fact the shell HTML writes that global itself (`dsh-client-modules`), so the probe now judges by what `#root` renders |
+| `dsh-web-mobile` 3.0.5 | **MIT** (author mexiaosh) | **Mobile UI adaptation**: lays the web UI out for portrait/narrow screens. Not optional decoration — without it a phone shows the desktop-width layout; the full MIT text is included (copyright line copied verbatim from the package's `LICENSE`) |
+
+The licensing obligations are governed by the `THIRD-PARTY-NOTICES.md` above / [THIRD-PARTY.md](THIRD-PARTY.md).
+
+Two plugins **used to** appear in early APKs and are now removed: `dsh-skin-whale-fantasy`
+(`CC-BY-NC-SA-4.0` — non-commercial and ShareAlike, so it cannot be distributed with the APK) and
+`dsh-pro-mode-splash` (MIT, purely decorative). On upgrade the app clears the leftover rows for them from the
+profile configuration — keeping them would make the loader fail at startup with “imported a plugin that does not exist”.
+
+`dsh-web-mobile` was also dropped once as “unnecessary” in beta13/beta14, and that judgement was wrong: it *is* the
+mobile UI adaptation itself. It has been back in the payload since `1.0.19-beta15` (MIT-compliant), and it is gone
+from `pruneRemovedRows()`'s `REMOVED_PLUGINS` as well.
 
 ---
 

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Default English app UI strings. -->
+<!-- Default English app UI strings. Chinese lives in values-zh/strings.xml. -->
 <resources>
     <string name="checking_for_updates">Checking for updates…</string>
     <string name="install_update">Install %1$s</string>
@@ -19,8 +19,23 @@
     <string name="log_copied">Log copied to clipboard</string>
     <string name="run_log">Run log</string>
     <string name="log">Log</string>
+    <string name="console">Console</string>
     <string name="diagnostic_runtime_ready">Diagnostic mode: runtime ready %1$s</string>
     <string name="runtime_ready">Ready: %1$s</string>
     <string name="runtime_exited">Runtime exited (code %1$d), see the log</string>
     <string name="open_file">Open %1$s</string>
+
+    <!-- Privilege routing (1.0.19): one channel per capability. -->
+    <string name="privilege_status">Privilege: %1$s</string>
+    <string name="privilege_channel_button">Privilege channel (Shizuku / root)</string>
+    <string name="accessibility_row_on">Accessibility: on</string>
+    <string name="accessibility_row_off">Accessibility: off (tap to open settings)</string>
+    <string name="projection_row_on">Screen capture: granted</string>
+    <string name="projection_row_on_failed">Screen capture: granted (last frame failed: %1$s)</string>
+    <string name="projection_row_off">Screen capture: not granted (tap to allow)</string>
+
+    <!-- Shown in Settings -> Accessibility -> Installed apps next to this app. -->
+    <string name="accessibility_service_label">DeepSeek Harness device control</string>
+    <string name="accessibility_summary">Zero-install tap / swipe / typing / screen reading</string>
+    <string name="accessibility_description">When enabled, DeepSeek Harness can tap, swipe and type into fields, and read the control structure of the current screen, without installing Shizuku and without root. Screenshots use a separate screen-capture grant and never go through here. You can turn this off in Settings at any time.</string>
 </resources>

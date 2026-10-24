@@ -286,7 +286,8 @@ const resolved = pathToFileURL(createRequire(baseUrl).resolve(name)).href;
 
 | 现象 | 根因 | 修法 |
 |---|---|---|
-| `node` 找不到 `node-addon-require-builtin` | 该 addon 无 Android 版本 | 让 `dsh-app-boot` 在加载失败时降级（try/catch） |
+| `node` 找不到 `node-addon-require-builtin` | 该 addon 无 Android 版本 | 用纯 JS 替身顶掉（P21）：`node-addon-require-builtin/lib/index.js` |
+| 模型请求一带截图就失败：`DeepSeek Messages transport failed [TRANSPORT]`，5 次重试几秒内全灭 | 载荷的纯 JS sharp 不实现 WebP 编码，而 0.2.1 的图片管线对带 alpha 的图（安卓截图是 RGBA）固定选 WebP；该错误不是 `LlmError`，被 `generate()` 兜底成 TRANSPORT 并按可重试错误重放 | P22：alpha 图在 WebP 档之后追加 PNG 档、候选失败可跳过、最终回落已存字节 |
 | `credentials-local: .credentials.yaml is readable beyond its owner (mode 755)` | Android 给文件组可读权限 | 启动前 `chmod 600`，并在缺失时预置 `{}` |
 | `Cannot find package 'semver'` 等 | profile 的模块视图缺失 | 见第 8 条 |
 | OpenSSL 报 `fopen(/data/data/com.termux/.../openssl.cnf): Permission denied` | Termux 的 node 把该路径编译进去了 | 设 `OPENSSL_CONF` / `SSL_CERT_FILE` / `SSL_CERT_DIR` 指向包内副本 |
@@ -484,6 +485,163 @@ node_modules/@vscode/ripgrep-android-arm64/package.json    ← 不要写 exports
 这类错不会报"平台不支持"，只会报"启动失败"。
 
 ---
+
+## 15. 0.2.1 的两种"鉴权失败"都只报一条 `TRANSPORT`（登录按钮则是空白页）
+
+**现象**：真机换 0.2.1-rc.2 之后，每一轮都是
+
+```
+已重试模型请求 (5/5) · 8s
+本轮运行失败  DeepSeek Messages transport failed   [TRANSPORT]
+```
+
+同一个账号、同一张网、换 0.2.0-rc.2（1.0.18）完全正常；开新会话一样；界面里的"登录"
+点开是空白页；而**单独**用真网络打 `api.deepseek.com` 拿到的是 `AUTH`（401），不是 TRANSPORT。
+
+**根因 1：跨副本的 `LlmError` 被改写成 TRANSPORT。**
+中转只有一处（`@deepseek-ai/dsh-llm-deepseek/lib/index.js` 的 `generate()`）：
+
+```js
+if (error instanceof LlmError) throw error;
+throw new LlmError("DeepSeek Messages transport failed", "TRANSPORT", { cause: error });
+```
+
+载荷/profile 一旦解析出**两份** `@deepseek-ai/dsh-llm`（runtime 一份、`$DSH_HOME/node_modules`
+一份），`instanceof` 跨 realm 恒 false，于是 `AUTH` / `MISSING_CREDENTIAL` /
+`ACCOUNT_SIGN_IN_REQUIRED` 这些真实代码**全部**变成 TRANSPORT，还会被 `llm-retry`
+按可重试错误重跑 5 次。已用两级对照实测（`headless` + 空凭据存储）：
+
+| 条件 | 输出 |
+|---|---|
+| 两份 `dsh-llm`（其中一份 0.2.0），捕获处未打补丁 | `TRANSPORT: DeepSeek Messages transport failed`（与真机同款） |
+| 同一场景，捕获处打 P23 | `MISSING_CREDENTIAL: llm-deepseek: no API key ...` |
+
+**所以真机那条 TRANSPORT 不是网络问题，是鉴权问题的错误标签。**
+
+**根因 2：0.2.1 的凭据优先级翻转。** `dsh-credentials-local` 从"继承环境变量优先"
+改成"`$DSH_HOME/.credentials.yaml` 优先"，并且 `llm-deepseek-api-key` 只有在
+`credentials` 服务**不存在**时才去看环境变量——服务存在但 `resolve()` 抛错时，
+环境变量里的 key 也不会被用上。
+
+**登录（0.2.1 新增）为什么在 App 里不可能一次点通。** 登录走的是
+`dsh-deepseek-account-platform`：`auth_init` → 浏览器打开
+`https://platform.deepseek.com/dsh/authorize`（PKCE S256）→ 回调
+`http://127.0.0.1:3010/oauth/callback` → `auth_exchange` 落地 `kind: grant` 记录 →
+之后模型请求带 `x-dsh-auth-token`。客户端实现是
+
+```js
+this.popup = window.open("about:blank", "_blank");   // BrowserLogin.begin()
+...
+this.popup.location.replace(this.destination(attempt.authorizeUrl));
+```
+
+Android WebView 没开 `setSupportMultipleWindows` / 没实现 `onCreateWindow`，
+`window.open` 拿不到可用的窗口 → 空白页。即使拿到，也还得有浏览器把回调打回
+`127.0.0.1:3010`。**结论：登录这条路要改 Java（WebView 多窗口），属于 App 侧；
+但聊天本身不需要它——API Key 路由仍然存在且是默认路由。**
+
+**修法**：P23（按品牌识别跨副本 `LlmError`，真 fetch 失败仍是 TRANSPORT）+ P24
+（凭据服务缺位/抛错时直读托管文档 `refs:`，只读，不进环境）。
+
+**验证**（容器内 bionic node，真 key）：
+
+```
+$ node .../@deepseek-ai/dsh/lib/bin.js headless "只回复两个字：收到"     # credentials 服务缺位
+收到
+```
+
+`POST https://api.deepseek.com/anthropic/v1/messages` → HTTP 200；换坏 key → HTTP 401
+`authentication_error`。两条都证明"凭据被服务端接受/拒绝"，而不是传输失败。
+
+---
+
+## 16. 一个裸的 `ReferenceError`，被包成 `TRANSPORT` 重试 5 次（新会话发不出消息）
+
+**现象**：新建会话，发第一条消息，界面报
+
+```
+已重试模型请求 (5/5)
+本轮运行失败  DeepSeek Messages transport failed   [TRANSPORT]
+```
+
+而**已有**的会话照常能聊；换 0.2.0 一切正常。
+
+**根因**：`dsh-session-persistence-jsonl/lib/index.js` 第 4 行从 `node:fs/promises`
+导入的清单是上游自己算的，**没有 `rename` / `copyFile` / `writeFile`** —— 上游不用它们。
+但本项目后加的 `publishExclusive()`（P3a）和 `rewriteSalvagedLog()`（P16d）要用：
+
+```js
+await rename(staged, target);            // P3a 的发布兜底、P16d 的重建
+await writeFile(staged, Buffer.concat(parts));
+await copyFile(path, `${path}.corrupt-${stamp}.bak`);
+```
+
+于是新建会话第一次发布日志就抛 `ReferenceError: rename is not defined`。
+它**不是** `LlmError`，所以走到 `dsh-llm-deepseek` 那一层时被当成传输错误：
+
+```js
+throw new LlmError("DeepSeek Messages transport failed", "TRANSPORT", { cause: error });
+```
+
+再被 `llm-retry` 重试 5 次 —— 真正的原因在这一路上一次都没被打印出来。
+
+**为什么容器里复现不出来**：在 Linux 上 `publishExclusive` 第一次 `link()` 就成功了，
+`rename` 那条兜底根本不执行；只有 Android app 域拒绝 `link(2)`（第 3 条）时才会走到它。
+所以"干净树上跑一遍拿到 `MISSING_CREDENTIAL`"只能证明模块加载正常，
+**不能**证明 rename 这条路径已被覆盖 —— 真正的证据是 import 行里有这个符号。
+
+**修法**（P25）：把三个符号补进第 4 行的 import。这条在脚本的「必成清单」里：
+锚点失配或落盘文本里没有这行 import，脚本直接以非 0 退出，不许打包。
+
+**教训**：`TRANSPORT` 这个标签覆盖了"网关没通"以外的太多东西。
+看到它先问一句：**cause 里是不是一个和网络毫无关系的 JS 错误？**
+
+---
+
+## 17. `dx` 拒绝 Shizuku 的 `invokedynamic`（minSdk 24），换 D8 才过
+
+**现象**
+
+把 Shizuku 的四个 AAR 解出 `classes.jar`、和本项目 class 一起交给 `dalvik-exchange`：
+
+```
+$ dalvik-exchange --dex --no-strict --min-sdk-version=24 --output=classes.dex app libs
+Uncaught translation error: ... Shizuku.addBinderReceivedListener: invalid opcode ba
+  - invokedynamic requires --min-sdk-version >= 26 (currently 24)
+Uncaught translation error: ... ShizukuRemoteProcess.<init>: same
+Uncaught translation error: ... ShizukuServiceConnection.connected: same
+3 errors; aborting
+```
+
+**根因**
+
+Shizuku 的 AAR 是按 Java 8 编译的，lambda 以 `invokedynamic`（opcode `ba`）留在 class 文件里。
+`dx` 不会 desugar：它只接受 `--min-sdk-version >= 26` 才肯翻译 `invokedynamic`，
+而本项目的 `minSdkVersion` 是 24（dex 里留 indy 在 Android 7 上直接过不了验证）。
+
+把 min-sdk 抬到 26 能让 dx 闭嘴，但那等于把 API 24/25 的设备踢出支持范围——
+**不要为了让工具不报错而改兼容性声明**。
+
+**验证**
+
+`strings classes.dex | grep -E "TRANSACTION_newProcess|Lrikka/shizuku/Shizuku;"`：
+用 D8 出来的 dex 里能看到这些符号，且 `dexdump` 不再有 `invoke-custom`。
+
+**修法**
+
+构建工具链里没有 Gradle，也就没有自带的 desugar。用 **D8**（R8 项目，`--min-api 24` 会真正把
+lambda desugar 成合成类）：
+
+```
+java -cp r8.jar com.android.tools.r8.D8 --min-api 24 --lib android.jar \
+     --output dex/ app-classes.jar shizuku-api.jar shizuku-aidl.jar \
+     shizuku-shared.jar shizuku-provider.jar
+```
+
+- D8 需要 `--lib`（android.jar）才能解析框架类型，否则报缺类。
+- **D8 不接受目录作为 program input**（`Unsupported source file type`），先把 `classes/` 打成 jar。
+- `min-api` 必须与清单的 `minSdkVersion` 一致（这里 24）。
+- 产物仍是单个 `classes.dex`，`zipalign` / `apksigner` 流程不变。
 
 ## 排查方法论
 

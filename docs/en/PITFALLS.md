@@ -288,7 +288,8 @@ they make no path assumptions. `rg` covers `grep` / `find`.
 
 | Symptom | Root cause | Fix |
 |---|---|---|
-| `node` cannot find `node-addon-require-builtin` | The addon has no Android version | Make `dsh-app-boot` degrade gracefully when loading fails (try/catch) |
+| `node` cannot find `node-addon-require-builtin` | The addon has no Android version | Replace it with a pure-JS stand-in (P21): `node-addon-require-builtin/lib/index.js` |
+| Every model request that carries a screenshot fails: `DeepSeek Messages transport failed [TRANSPORT]`, 5 retries die within seconds | The payload's pure-JS sharp cannot encode WebP, while the 0.2.1 image pipeline always picks WebP for images with alpha (Android screenshots are RGBA); the error is not an `LlmError`, so `generate()` falls back to TRANSPORT and `llm-retry` replays it as retryable | P22: append a PNG candidate after the WebP one for alpha images, allow candidates to fail, and finally fall back to the already-stored bytes |
 | `credentials-local: .credentials.yaml is readable beyond its owner (mode 755)` | Android gives files group-read permission | Run `chmod 600` before startup, and prepopulate `{}` if the file is missing |
 | `Cannot find package 'semver'`, etc. | The profile's module view is missing | See item 8 |
 | OpenSSL reports `fopen(/data/data/com.termux/.../openssl.cnf): Permission denied` | Termux's node has this path compiled in | Set `OPENSSL_CONF` / `SSL_CERT_FILE` / `SSL_CERT_DIR` to point to bundled copies |
@@ -486,6 +487,165 @@ When cross-packaging, `optionalDependencies` are selected for the build machine,
 this kind of error does not report “unsupported platform”; it only reports “failed to start.”
 
 ---
+
+## 15. Both 0.2.1 “authentication failures” report only `TRANSPORT` (and the sign-in button opens a blank page)
+
+**Symptom**: after moving the device to 0.2.1-rc.2, every round looks like
+
+```
+已重试模型请求 (5/5) · 8s
+本轮运行失败  DeepSeek Messages transport failed   [TRANSPORT]
+```
+
+Same account, same network, 0.2.0-rc.2 (1.0.18) works perfectly; new sessions behave the same; the “sign in” entry in the UI opens
+a blank page; yet hitting `api.deepseek.com` **directly** returns `AUTH` (401), not TRANSPORT.
+
+**Root cause 1: an `LlmError` from another copy gets rewritten as TRANSPORT.**
+The wrapping happens in exactly one place (`generate()` in `@deepseek-ai/dsh-llm-deepseek/lib/index.js`):
+
+```js
+if (error instanceof LlmError) throw error;
+throw new LlmError("DeepSeek Messages transport failed", "TRANSPORT", { cause: error });
+```
+
+The moment the payload/profile resolves **two copies** of `@deepseek-ai/dsh-llm` (one in the runtime, one in
+`$DSH_HOME/node_modules`), `instanceof` is permanently false across realms, so the real codes `AUTH` /
+`MISSING_CREDENTIAL` / `ACCOUNT_SIGN_IN_REQUIRED` **all** turn into TRANSPORT, and `llm-retry` replays them
+5 times as retryable errors. Verified with a two-level control (`headless` + an empty credential store):
+
+| Condition | Output |
+|---|---|
+| Two copies of `dsh-llm` (one of them 0.2.0), no patch at the catch site | `TRANSPORT: DeepSeek Messages transport failed` (identical to the device) |
+| Same scenario with P23 at the catch site | `MISSING_CREDENTIAL: llm-deepseek: no API key ...` |
+
+**So that TRANSPORT on the device was not a network problem; it was a wrong label on an authentication problem.**
+
+**Root cause 2: 0.2.1 inverted the credential priority.** `dsh-credentials-local` went from “inherited environment variables first”
+to “`$DSH_HOME/.credentials.yaml` first”, and `llm-deepseek-api-key` only consults the environment when the
+`credentials` service **does not exist** — if the service exists but `resolve()` throws, the key in the
+environment is not used either.
+
+**Why sign-in (new in 0.2.1) cannot work in one tap inside the app.** Sign-in goes through
+`dsh-deepseek-account-platform`: `auth_init` → a browser opens
+`https://platform.deepseek.com/dsh/authorize` (PKCE S256) → the callback arrives at
+`http://127.0.0.1:3010/oauth/callback` → `auth_exchange` stores a `kind: grant` record →
+later model requests carry `x-dsh-auth-token`. The client implementation is
+
+```js
+this.popup = window.open("about:blank", "_blank");   // BrowserLogin.begin()
+...
+this.popup.location.replace(this.destination(attempt.authorizeUrl));
+```
+
+Android WebView neither enables `setSupportMultipleWindows` nor implements `onCreateWindow`, so
+`window.open` gets no usable window → blank page. And even with one, some browser would still have to deliver the
+callback to `127.0.0.1:3010`. **Conclusion: this path needs Java work (multi-window WebView) and belongs to the app
+side; but chat itself does not need it — the API-key route still exists and is the default.**
+
+**Fix**: P23 (recognise a cross-copy `LlmError` by brand, so a genuine fetch failure is still TRANSPORT) + P24
+(read the managed document's `refs:` directly when the credential service is missing or throws; read-only, never
+into the environment).
+
+**Verification** (bionic node inside the container, real key):
+
+```
+$ node .../@deepseek-ai/dsh/lib/bin.js headless "只回复两个字：收到"     # credentials service absent
+收到
+```
+
+`POST https://api.deepseek.com/anthropic/v1/messages` → HTTP 200; with a bad key → HTTP 401
+`authentication_error`. Both prove “the credential was accepted/refused by the server”, not a transport failure.
+
+---
+
+## 16. A bare `ReferenceError` wrapped as TRANSPORT and retried 5 times (a new session cannot send a message)
+
+**Symptom**: create a session, send the first message, and the UI reports
+
+```
+已重试模型请求 (5/5)
+本轮运行失败  DeepSeek Messages transport failed   [TRANSPORT]
+```
+
+while **existing** sessions keep working normally; with 0.2.0 everything is fine.
+
+**Root cause**: the import list on line 4 of `dsh-session-persistence-jsonl/lib/index.js` (from
+`node:fs/promises`) was computed upstream and **does not include `rename` / `copyFile` / `writeFile`** — upstream
+never used them. But this project's own `publishExclusive()` (P3a) and `rewriteSalvagedLog()` (P16d) do:
+
+```js
+await rename(staged, target);            // P3a's publication fallback, P16d's rebuild
+await writeFile(staged, Buffer.concat(parts));
+await copyFile(path, `${path}.corrupt-${stamp}.bak`);
+```
+
+So the first log publication in a new session throws `ReferenceError: rename is not defined`. It is **not** an
+`LlmError`, so by the time it reaches `dsh-llm-deepseek` it is treated as a transport error:
+
+```js
+throw new LlmError("DeepSeek Messages transport failed", "TRANSPORT", { cause: error });
+```
+
+and `llm-retry` retries it 5 times — the real cause is never printed anywhere along that path.
+
+**Why it does not reproduce in the container**: on Linux the first `link()` in `publishExclusive` succeeds, so the
+`rename` fallback never runs; only the Android app domain refusing `link(2)` (item 3) reaches it.
+So “run it on a clean tree and get `MISSING_CREDENTIAL`” only proves that the module loads —
+**it does not prove the rename path has been covered**; the real evidence is that the symbol is in the import line.
+
+**Fix** (P25): add the three symbols to the import on line 4. This one is in the script's `MUST_APPLY` /
+`MUST_STATE` list: an anchor mismatch, or the absence of that import line in the written text, makes the script
+exit non-zero — packaging is not allowed to continue.
+
+**Lesson**: the `TRANSPORT` label covers far more than “the gateway did not respond”.
+When you see it, ask first: **is the cause a JS error that has nothing to do with the network?**
+
+---
+
+## 17. `dx` rejects Shizuku's `invokedynamic` at minSdk 24; only D8 gets through
+
+**Symptom**
+
+Unpack the four Shizuku AARs into `classes.jar` and hand them, together with this project's classes, to `dalvik-exchange`:
+
+```
+$ dalvik-exchange --dex --no-strict --min-sdk-version=24 --output=classes.dex app libs
+Uncaught translation error: ... Shizuku.addBinderReceivedListener: invalid opcode ba
+  - invokedynamic requires --min-sdk-version >= 26 (currently 24)
+Uncaught translation error: ... ShizukuRemoteProcess.<init>: same
+Uncaught translation error: ... ShizukuServiceConnection.connected: same
+3 errors; aborting
+```
+
+**Root cause**
+
+Shizuku's AARs are compiled for Java 8, so their lambdas stay in the class files as `invokedynamic` (opcode `ba`).
+`dx` does not desugar: it only translates `invokedynamic` when `--min-sdk-version >= 26`, and this project's
+`minSdkVersion` is 24 (leaving indy in the dex fails verification on Android 7 outright).
+
+Raising min-sdk to 26 silences dx, but that kicks API 24/25 devices out of the supported range —
+**never change a compatibility claim just to quiet a tool.**
+
+**Verification**
+
+`strings classes.dex | grep -E "TRANSACTION_newProcess|Lrikka/shizuku/Shizuku;"`: the dex produced by D8 shows
+those symbols, and `dexdump` no longer reports `invoke-custom`.
+
+**Fix**
+
+The build toolchain has no Gradle, hence no bundled desugar. Use **D8** (from the R8 project; `--min-api 24` really
+does desugar lambdas into synthetic classes):
+
+```
+java -cp r8.jar com.android.tools.r8.D8 --min-api 24 --lib android.jar \
+     --output dex/ app-classes.jar shizuku-api.jar shizuku-aidl.jar \
+     shizuku-shared.jar shizuku-provider.jar
+```
+
+- D8 needs `--lib` (android.jar) to resolve framework types, or it reports missing classes.
+- **D8 does not accept a directory as program input** (`Unsupported source file type`); pack `classes/` into a jar first.
+- `min-api` must match the manifest's `minSdkVersion` (24 here).
+- The output is still a single `classes.dex`; `zipalign` / `apksigner` are unchanged.
 
 ## Troubleshooting methodology
 
