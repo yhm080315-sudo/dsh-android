@@ -789,7 +789,7 @@ public class NodeServer extends Service {
              * `existing.contains(row[1])` checks below would otherwise see the stale
              * line and think the row is already in place.
              */
-            String pruned = pruneRemovedRows(existing);
+            String pruned = pruneRemovedRows(existing, web);
             boolean removedRows = !pruned.equals(existing);
             if (removedRows) {
                 logLine("profile patch: dropped rows for plugins this build no longer ships");
@@ -874,10 +874,16 @@ public class NodeServer extends Service {
      * to the entry above it, and inside an insert block the next four-space `- `
      * starts a new item. Messages and other keys below `name:` are left alone.
      *
+     * A row is only dropped when the package really is missing: a plugin the
+     * user installed themselves keeps its row even though this build does not
+     * ship it (see userInstalledAt()). Pruning those would leave the plugin
+     * file sitting in the profile forever while the line that loads it is
+     * deleted on every start.
+     *
      * Returns the text unchanged when nothing matched, so the caller can tell
      * "already clean" from "cleaned" without diffing files.
      */
-    private static String pruneRemovedRows(String text) {
+    private String pruneRemovedRows(String text, File web) {
         String body = text.endsWith("\n") ? text.substring(0, text.length() - 1) : text;
         if (body.isEmpty()) {
             return text;
@@ -904,7 +910,7 @@ public class NodeServer extends Service {
                     while (itemEnd < end && !lines[itemEnd].startsWith("    - ")) {
                         itemEnd++;
                     }
-                    if (!namesRemovedPlugin(lines, item, itemEnd)) {
+                    if (!namesRemovedPlugin(lines, item, itemEnd, web)) {
                         for (int k = item; k < itemEnd; k++) {
                             kept.add(lines[k]);
                         }
@@ -916,7 +922,7 @@ public class NodeServer extends Service {
                     out.add(lines[i]);
                     out.addAll(kept);
                 }
-            } else if (!namesRemovedPlugin(lines, i, end)) {
+            } else if (!namesRemovedPlugin(lines, i, end, web)) {
                 for (int k = i; k < end; k++) {
                     out.add(lines[k]);
                 }
@@ -930,8 +936,11 @@ public class NodeServer extends Service {
         return sb.toString();
     }
 
-    /** True when lines[from,to) carries a `name:` this build dropped. */
-    private static boolean namesRemovedPlugin(String[] lines, int from, int to) {
+    /**
+     * True when lines[from,to) carries a `name:` this build dropped and the user
+     * has not installed that package themselves.
+     */
+    private boolean namesRemovedPlugin(String[] lines, int from, int to, File web) {
         for (int k = from; k < to; k++) {
             String t = lines[k].trim();
             if (!t.startsWith("name:")) {
@@ -946,12 +955,104 @@ public class NodeServer extends Service {
                 }
             }
             for (String gone : REMOVED_PLUGINS) {
-                if (gone.equals(value)) {
+                if (!gone.equals(value)) {
+                    continue;
+                }
+                String mine = userInstalledAt(gone, web);
+                if (mine != null) {
+                    logLine("prune: keeping " + gone + " row (user-installed at " + mine + ")");
+                } else {
+                    logLine("prune: removing " + gone + " row (not installed by user)");
                     return true;
                 }
             }
         }
         return false;
+    }
+
+    /**
+     * Where the user's own copy of a removed plugin lives, or null when there
+     * is none.
+     *
+     * The prune exists for a real failure: a profile written by an older build
+     * names packages this build no longer ships, and the Loader then refuses to
+     * start with "Cannot find module". That must keep working. What it must not
+     * do is delete a row the user earned -- we do not ship the plugin, but
+     * nothing stops them installing it themselves, and their row has to survive
+     * every start.
+     *
+     * So the question is not "is there a file lying around", it is "can the
+     * Loader resolve this name from the profile": that is the profile's own
+     * node_modules entry, where installSideLoadedPlugins() unpacks
+     * /sdcard/DSH/plugins before this runs, and where a hand-installed package
+     * lands too. The side-load inbox is then only used to report where the copy
+     * came from: a tarball that is sitting there but did not install must not
+     * buy the row its life, or the very boot failure being prevented returns.
+     *
+     * Names are compared whole, never as a substring: dsh-web-mobile can never
+     * match a rule about dsh-boot-animation.
+     */
+    private String userInstalledAt(String name, File web) {
+        if (web == null) {
+            return null;
+        }
+        File module = new File(new File(web, "node_modules"), name);
+        boolean loadable = module.isDirectory()
+                && (new File(module, "package.json").isFile()
+                        || new File(module, "index.js").isFile());
+        File sideLoad = sideLoadedEntry(name);
+        if (!loadable) {
+            if (sideLoad != null) {
+                logLine("prune: " + name + " side-load " + sideLoad.getAbsolutePath()
+                        + " is present but not installed; the row still goes");
+            }
+            return null;
+        }
+        if (sideLoad != null) {
+            return module.getAbsolutePath() + ", side-loaded from " + sideLoad.getAbsolutePath();
+        }
+        return module.getAbsolutePath();
+    }
+
+    /**
+     * The /sdcard/DSH/plugins entry naming exactly this plugin, or null.
+     *
+     * Both shapes a user can leave there count: a directory named after the
+     * package, and an npm tarball -- `<name>.tgz`, `<name>-<version>.tgz` or
+     * `<name>@<version>.tgz`, which is what `npm pack` writes. The character
+     * after the name has to start a version, so `dsh-boot-animation-extra-1.0.0.tgz`
+     * is a different package and is left alone.
+     */
+    private static File sideLoadedEntry(String name) {
+        File[] entries = new File("/sdcard/DSH/plugins").listFiles();
+        if (entries == null) {
+            return null;
+        }
+        for (File entry : entries) {
+            String file = entry.getName();
+            if (file.equals(name)) {
+                return entry;
+            }
+            if (!file.endsWith(".tgz") || file.length() <= ".tgz".length() + name.length()) {
+                continue;
+            }
+            String stem = file.substring(0, file.length() - ".tgz".length());
+            if (stem.equals(name)) {
+                return entry;
+            }
+            if (versionedStem(stem, name + "-") || versionedStem(stem, name + "@")) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    /** True when `stem` is `prefix` followed by something that starts with a digit. */
+    private static boolean versionedStem(String stem, String prefix) {
+        if (!stem.startsWith(prefix) || stem.length() == prefix.length()) {
+            return false;
+        }
+        return Character.isDigit(stem.charAt(prefix.length()));
     }
 
     /**
