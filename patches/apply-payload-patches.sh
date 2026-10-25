@@ -1797,6 +1797,802 @@ patch(
     "P26 老 WebView 的 polyfill",
 )
 
+
+# ── P27: 附件发布用 link(2)，而 app 私有存储拒绝硬链接 ───────────────────────
+# 现场（Issue #4：OPPO PKM110 / Android 16、未 root、1.0.19）：
+#   发图片 → 「图片发送失败 (ATTACHMENT_WRITE_FAILED)」；
+#   agent 读图 → 「Unable to persist attachment.」；
+#   发 txt / pdf / zip → 同样 ATTACHMENT_WRITE_FAILED。
+#   与格式、尺寸、磁盘（195 GB 可用）无关；staging 可写、objects 下可建目录；
+#   fsync / chmod / rename 全部正常，只有 link(2) 返回 EACCES。
+#   App 自己在每次启动时就探测过这条限制（files/dsh.log 第 10 行
+#   「hard link: FAILED -> java.nio.file.AccessDeniedException」），只是附件这条路没走回落。
+# 版本背景：0.2.0 的发布路径用 rename，所以 1.0.18 没事；0.2.1 改成
+#   「link() 建不可变对象 + unlink() 删 staging」，于是在这台机器上撞墙。
+#
+# 同一文件里有两处 link()，回落方式**不同**，不能照抄 —— 这是本补丁的重点：
+#   P27a publishStagedObject()  staging 与目标同分区 → 回落 rename()（同样原子，
+#        staged 名字直接消失，所以后面那次 unlink 要跳过，否则 ENOENT）
+#   P27b publishImmutableAlias() source 是 canonical object，别的 alias 还在引用它，
+#        移走会破坏别人 → 回落「读字节再写」，并用 wx 保住 link 原有的独占创建语义
+# errno 判据照用户在本机验证过的补丁：EEXIST 仍走原来的 digest 校验；
+#   EACCES / EPERM / ENOSYS / ENOTSUP / EXDEV 回落；其它错误照旧抛出。
+#
+# 注：`rename` / `readFile` / `writeFile` 都已在 attachment-local 的 import 里（第 7 行），
+# 不像 P25 那样需要补符号。
+patch(
+    "@deepseek-ai/dsh-attachment-local/lib/index.js",
+    """		try {
+			await link(staged.path, target);
+		} catch (error) {
+			/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
+			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+			if (await digestFile(target) !== staged.sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
+		}
+		await unlink(staged.path);
+""",
+    """		/* Android's app-private storage refuses link(2) with EACCES -- the app probes this on
+		 * every boot ("hard link: FAILED -> AccessDeniedException") while fsync, chmod and
+		 * rename all work there. Staging lives on the same filesystem as the target, so
+		 * rename(2) publishes just as atomically and consumes the staged name: that is why the
+		 * trailing unlink is skipped once rename took the file. */
+		let stagedConsumed = false;
+		try {
+			await link(staged.path, target);
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? error.code : void 0;
+			if (code === "EEXIST") {
+				if (await digestFile(target) !== staged.sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
+			} else if (code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+				await rename(staged.path, target);
+				stagedConsumed = true;
+			} else throw error;
+		}
+		if (!stagedConsumed) await unlink(staged.path);
+""",
+    "let stagedConsumed = false;",
+    "P27a 附件对象发布：link 被拒时回落 rename",
+)
+patch(
+    "@deepseek-ai/dsh-attachment-local/lib/index.js",
+    """		try {
+			await link(source, target);
+		} catch (error) {
+			/* v8 ignore next -- Private same-filesystem directories make EEXIST the only recoverable link race. */
+			if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+			if (await digestFile(target) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
+		}
+""",
+    """		/* Same platform limit as publishStagedObject(), different fallback: `source` is the
+		 * canonical object and other aliases still reference it, so it must stay where it is --
+		 * rename would break every one of them. Copy the bytes instead; "wx" keeps the
+		 * exclusive-create semantics link(2) gave us, and mode 384 (0o600) matches the patch
+		 * this was verified with on the device. */
+		try {
+			await link(source, target);
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? error.code : void 0;
+			if (code === "EEXIST") {
+				if (await digestFile(target) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
+			} else if (code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+				await writeFile(target, await readFile(source), { mode: 384, flag: "wx" });
+			} else throw error;
+		}
+""",
+    'await writeFile(target, await readFile(source), { mode: 384, flag: "wx" });',
+    "P27b 附件别名发布：link 被拒时读字节再写（不能 rename）",
+)
+
+
+# ── P27c: alias 的 copy 回落也要保住「独占创建 + EEXIST 去重」───────────────
+# 这条是容器验证抓出来的：`storedFilePath()` 的 target 也是内容寻址的
+# （files/<sha[:2]>/<sha>/<name>），所以**同一个文件发第二次**（或重试一次）会
+# 落到同一个 target 上。用 link 时第二次是 EEXIST → 走 digest 校验 → 正常去重；
+# 而 P27b 的 copy 回落写死了 flag:"wx"，EEXIST 会直接抛出去 →
+# 表现成「同一个文件发第二次报 ATTACHMENT_WRITE_FAILED」，是 P27 会引入的新回归。
+# 判据不新增：copy 拿到 EEXIST 时，接回**上面已有的** digest 校验分支，
+# 与 link 的 EEXIST 分支完全一致。只在 Android 的回落路径上生效。
+patch(
+    "@deepseek-ai/dsh-attachment-local/lib/index.js",
+    """			} else if (code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+				await writeFile(target, await readFile(source), { mode: 384, flag: "wx" });
+			} else throw error;
+""",
+    """			} else if (code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+				try {
+					await writeFile(target, await readFile(source), { mode: 384, flag: "wx" });
+				} catch (copyError) {
+					/* The copy keeps the exclusivity link(2) had: a target that appeared in between
+					 * is deduplicated exactly like the EEXIST branch above instead of failing the
+					 * save. Stored file paths are content-addressed, so saving one attachment a
+					 * second time (or retrying one upload) lands here. */
+					const copyCode = copyError instanceof Error && "code" in copyError ? copyError.code : void 0;
+					if (copyCode !== "EEXIST") throw copyError;
+					if (await digestFile(target) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
+				}
+			} else throw error;
+""",
+    'if (copyCode !== "EEXIST") throw copyError;',
+    "P27c alias 回落的 EEXIST 接回 digest 去重",
+)
+
+# ── P28: 会话写租约的僵尸锁（pid 被复用时 EPERM 被当成「还活着」）─────────────
+# 现场（Issue #4 顺带 A）：客户端报「当前会话已被占用，可能是其他正在运行的 DSH 导致的」
+# （session/writer-held）；冷启动后旧进程已死，会话依然打不开。
+# P20 的目录式租约（session.lock.d + pid 判活）只记 pid，而判活是：
+#     kill(pid, 0) 成功 -> 活；EPERM -> 「进程存在但属于别人」-> 也算活
+# 旧 PID 一旦被别的 uid 的进程复用，kill 就永远回 EPERM，于是租约被判「仍存活」，
+# 这个会话就被永久锁死。用户实测两次清理时锁里的 PID 都指向已死进程，其中一次 kill -0 = EPERM。
+#
+# 修法（保守优先，宁可让人等一次，也不能让两个写者同时写）：
+#   1. 租约里除 pid 再记 `/proc/<pid>/stat` 的 starttime（field 22）作为**身份**。
+#      pid 相同 + starttime 相同 = 同一个进程 → 持有；不相同 = 内核把 pid 回收给了别人 → 立刻破锁。
+#      这一步就解决用户报的那种场景，不用等。
+#   2. 身份读不出来（/proc 不可读、异 uid）时，EPERM **不**再单独当作存活证据；
+#      只有租约年龄超过很长阈值（默认 30 分钟，DSH_SESSION_LEASE_TAKEOVER_MS 可调，低于 10 分钟拒绝）
+#      才接管，并且**打日志**说明「被判为不可识别、按超时接管」。
+#   3. 其余不确定情形一律维持原判（持锁），因为两写者撕裂日志的代价比多等一次大。
+# 破锁前仍复核 pid + starttime + inode，接替者换过的新租约不会被误删。
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """/** Name of the holder record inside a directory-form lease. */
+const LEASE_PID_FILENAME = "pid";
+""",
+    """/** Name of the holder record inside a directory-form lease. */
+const LEASE_PID_FILENAME = "pid";
+/** Name of the holder identity record inside a directory-form lease (`/proc/<pid>/stat` field 22). */
+const LEASE_START_FILENAME = "start";
+/**
+* How long an unidentifiable holder may keep a lease before a successor takes it
+* over. A live writer throttled by the platform can stay silent for a long time,
+* and expropriating it interleaves two writers over one log, so this is a last
+* resort and deliberately long: thirty minutes by default, ten minutes is the
+* lowest a setting may go (`DSH_SESSION_LEASE_TAKEOVER_MS`).
+*/
+const LEASE_TAKEOVER_MS = (() => {
+	const configured = Number.parseInt(process.env.DSH_SESSION_LEASE_TAKEOVER_MS ?? "", 10);
+	return Number.isSafeInteger(configured) && configured >= 600000 ? configured : 1800000;
+})();
+""",
+    "const LEASE_TAKEOVER_MS = (() => {",
+    "P28a 租约增加身份记录文件名与超时接管阈值",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """/**
+* Whether a recorded holder pid still names a running process.
+* @param pid - the recorded holder pid.
+* @returns true while that process exists.
+*/
+function isProcessAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		/* EPERM means the process exists but belongs to someone else. */
+		return error?.code === "EPERM";
+	}
+}
+""",
+    """/**
+* Read one process's start time: field 22 of `/proc/<pid>/stat`, in clock ticks
+* since boot. A pid is not an identity -- the kernel hands the same number to a
+* later process -- so the holder records this token and a successor compares it.
+* The field list is split after the last `)`: `comm` (field 2) is parenthesised
+* and may itself contain spaces and parentheses, which puts state (field 3) at
+* index 0 and starttime (field 22) at index 19.
+* @param pid - the process id to identify.
+* @returns the start-time token, or undefined when procfs cannot answer.
+*/
+async function readProcessStartTime(pid) {
+	try {
+		const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+		const starttime = stat.slice(stat.lastIndexOf(")") + 1).trim().split(" ")[19];
+		return starttime !== undefined && /^[0-9]+$/.test(starttime) ? starttime : undefined;
+	} catch {
+		return undefined;
+	}
+}
+/**
+* How a recorded holder pid answers a zero-signal probe. `EPERM` is kept apart
+* from `ESRCH` on purpose: it says the pid exists under another uid, which is the
+* recycled-pid case, not proof that our writer is still there.
+* @param pid - the recorded holder pid.
+* @returns `"running"`, `"gone"`, `"denied"` or `"unknown"`.
+*/
+function probeProcess(pid) {
+	try {
+		process.kill(pid, 0);
+		return "running";
+	} catch (error) {
+		const code = error?.code;
+		if (code === "ESRCH") return "gone";
+		if (code === "EPERM") return "denied";
+		return "unknown";
+	}
+}
+/**
+* Judge a recorded directory-lease holder.
+*
+* `EPERM` alone is not proof of life: an app whose old pid was handed to a process
+* under another uid answers `EPERM` forever, which is the zombie lease that locked
+* a session out for good. Identity comes from the start time instead -- same pid
+* and same start time is the same process, a different start time is a recycled
+* pid -- and only when neither side can be read does the long takeover threshold
+* decide. Two writers over one log is the outcome worth waiting for, so every
+* unclear answer keeps the lease.
+* @param record - the observed holder record and its age.
+* @returns `"held"`, `"gone"`, `"reused"` or `"stale"`.
+*/
+async function leaseHolderVerdict(record) {
+	const current = await readProcessStartTime(record.pid);
+	if (record.start !== undefined && current !== undefined) return current === record.start ? "held" : "reused";
+	if (probeProcess(record.pid) === "gone") return "gone";
+	return record.ageMs >= LEASE_TAKEOVER_MS ? "stale" : "held";
+}
+""",
+    "async function leaseHolderVerdict(record) {",
+    "P28b 判活改看 pid + /proc starttime 身份（EPERM 不再等于存活）",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """	try {
+		return Number.parseInt((await readFile(join(dir, LEASE_PID_FILENAME), "utf8")).trim(), 10) || 0;
+	} catch {
+		return 0;
+	}
+}
+""",
+    """	try {
+		return Number.parseInt((await readFile(join(dir, LEASE_PID_FILENAME), "utf8")).trim(), 10) || 0;
+	} catch {
+		return 0;
+	}
+}
+/**
+* Read the holder identity token recorded inside a directory-form lease.
+* @param dir - the lease directory.
+* @returns the start-time token, or undefined when no usable record exists.
+*/
+async function readLeaseStart(dir) {
+	try {
+		const token = (await readFile(join(dir, LEASE_START_FILENAME), "utf8")).trim();
+		return /^[0-9]+$/.test(token) ? token : undefined;
+	} catch {
+		return undefined;
+	}
+}
+/**
+* Read everything a verdict needs about a directory-form lease: the holder pid, the
+* identity token it wrote, and how long the lease has existed. The directory is
+* created and then written once, so its mtime is that moment; an unreadable mtime
+* yields age 0, which can only keep a lease, never break one.
+* @param dir - the lease directory.
+* @param observed - the `dev`/`ino`/`mtime` capture taken when the lease was seen.
+* @returns the holder record.
+*/
+async function readLeaseRecord(dir, observed) {
+	const pid = await readLeaseHolder(dir);
+	const born = Number(observed.mtimeMs);
+	return {
+		pid,
+		start: await readLeaseStart(dir),
+		ageMs: Number.isFinite(born) ? Date.now() - born : 0
+	};
+}
+""",
+    "async function readLeaseRecord(dir, observed) {",
+    "P28c 读租约记录（pid + 身份 + 年龄）",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """* Create `dir` as this process's lease. `mkdir` is the arbiter: it either
+* creates the directory or fails `EEXIST`, and that decision is atomic across
+* processes. A recorded holder that still exists keeps the lease — there is
+* deliberately no age threshold, because a writer throttled by the platform can
+* stay silent longer than any timeout, and expropriating it is exactly the
+* two-writer interleaving that tears a log. Only a recorded pid that provably
+* no longer exists is broken out of.
+""",
+    """* Create `dir` as this process's lease. `mkdir` is the arbiter: it either
+* creates the directory or fails `EEXIST`, and that decision is atomic across
+* processes. A recorded holder that is still the same process keeps the lease —
+* identity is pid plus its `/proc/<pid>/stat` start time, because `kill(pid, 0)`
+* answering `EPERM` for a recycled pid used to read as alive and lock the session
+* for good. A recycled pid or a provably absent one is broken out of at once; a
+* holder that cannot be identified at all is taken over only past
+* {@link LEASE_TAKEOVER_MS}, since a throttled writer that is still alive must
+* never lose exclusion.
+""",
+    "answering `EPERM` for a recycled pid used to read as alive",
+    "P28d createLeaseDirectory 注释同步新判活规则",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """		const observed = await stat(dir, { bigint: true });
+		const holder = await readLeaseHolder(dir);
+		if (holder === 0) {
+			/* An absent or malformed record is not proof of death: refuse rather than risk a second writer. */
+			console.error(`[session] refusing the session write lease: no readable holder record in ${join(dir, LEASE_PID_FILENAME)} (${dir})`);
+			throw leaseContention();
+		}
+		if (isProcessAlive(holder)) throw leaseContention();
+		console.error(`[session] breaking an abandoned session write lease (holder=${holder}, that pid is gone): ${dir}`);
+		/* Break it only while the observed record and inode still identify that dead
+		 * holder: a lease a successor already replaced is the successor's, not ours. */
+		if ((await readLeaseHolder(dir)) === holder && await isSameLeaseDirectory(dir, observed)) await rm(dir, { recursive: true, force: true });
+""",
+    """		const observed = await stat(dir, { bigint: true });
+		const record = await readLeaseRecord(dir, observed);
+		if (record.pid === 0) {
+			/* An absent or malformed record is not proof of death: refuse rather than risk a second writer. */
+			console.error(`[session] refusing the session write lease: no readable holder record in ${join(dir, LEASE_PID_FILENAME)} (${dir})`);
+			throw leaseContention();
+		}
+		const verdict = await leaseHolderVerdict(record);
+		if (verdict === "held") throw leaseContention();
+		if (verdict === "reused") console.error(`[session] breaking a session write lease whose pid was recycled: holder=${record.pid} recorded-start=${record.start} current-start=${await readProcessStartTime(record.pid)} probe=${probeProcess(record.pid)} (${dir})`);
+		else if (verdict === "stale") console.error(`[session] taking over an unidentifiable session write lease past the ${Math.round(LEASE_TAKEOVER_MS / 1000)}s threshold: holder=${record.pid} recorded-start=${record.start ?? "unknown"} probe=${probeProcess(record.pid)} age=${Math.round(record.ageMs / 1000)}s (${dir}) — a live writer behind that pid would lose exclusion, so this only fires when nothing identifies it`);
+		else console.error(`[session] breaking an abandoned session write lease (holder=${record.pid}, that pid is gone): ${dir}`);
+		/* Break it only while the observed record, identity, and inode still name that
+		 * dead holder: a lease a successor already replaced is the successor's, not ours. */
+		if ((await readLeaseHolder(dir)) === record.pid && (await readLeaseStart(dir)) === record.start && await isSameLeaseDirectory(dir, observed)) await rm(dir, { recursive: true, force: true });
+""",
+    "breaking a session write lease whose pid was recycled",
+    "P28e 接管判据：身份/超时，破锁前复核 pid + 身份 + inode",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """	const inode = await stat(dir, { bigint: true });
+	try {
+		await writeFile(join(dir, LEASE_PID_FILENAME), String(process.pid));
+""",
+    """	const inode = await stat(dir, { bigint: true });
+	try {
+		await writeFile(join(dir, LEASE_PID_FILENAME), String(process.pid));
+		/* Record this process's kernel identity beside the pid: without it a successor cannot
+		 * tell "the same writer" from "a stranger the kernel handed this pid to", which is the
+		 * zombie lease. Best effort only -- a missing token falls back to the long takeover
+		 * threshold, never to a blind break. */
+		const start = await readProcessStartTime(process.pid);
+		if (start !== undefined) await writeFile(join(dir, LEASE_START_FILENAME), start);
+""",
+    "const start = await readProcessStartTime(process.pid);",
+    "P28f 建租约时写入身份 token",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """* it. A recorded pid that still exists keeps the lease — deliberately with no
+* age threshold, for the throttling reason above — while a pid that is
+* provably gone is broken out of, so a crashed holder blocks only until the
+* next acquire. Android takes this path because its native flock entry is a
+""",
+    """* it. The record carries the holder's pid and its `/proc/<pid>/stat` start time, so
+* "still exists" means "still that process": a pid the kernel recycled is broken out
+* of at once, where `EPERM` for a stranger's pid used to read as alive and lock the
+* session for good. A holder that cannot be identified at all is taken over only
+* past a long threshold, because a throttled writer that is still alive must never
+* lose exclusion. Android takes this path because its native flock entry is a
+""",
+    '"still exists" means "still that process"',
+    "P28g 租约模块注释同步 pid+starttime 身份",
+)
+
+# ── P29: 交付物卡片的「桌面动作」在 Android 上恒报「无法读取主机桌面信息」────
+# 现场（Issue #4 顺带 B）：卡片上出现「无法读取主机桌面信息 · 重试」（locale key
+# presented.hostError），文件本身正常。
+# 判定链（本轮重新查过，结论和上一轮的 P14/P15/P16 不同）：
+#   P15/P16 已经让服务端认了 android ——
+#     nativeFileManager('android') -> "android"，canOpenNativePath('android') -> true，
+#     openNativePathWithIntent / revealNativePath 都改走 dsh-open
+#     （→ App 的 /device/open → FileProvider + 系统分享面板）。
+#   于是 /api/present.host 返回 { name, available: true, fileManager: "android" }。
+#   但客户端 isPresentedHost() 的 fileManager 白名单只有 null/finder/explorer/directory，
+#   "android" 被当成非法响应 → readHost 落 host = "error" → 卡片渲染 presented.hostError。
+# 也就是说：这个动作在 Android 上**不是**必然失败，是客户端把合法回答判成了坏数据。
+# 所以不做「隐藏按钮」，而是让白名单认 "android"：两个动作随后都落到 dsh-open，
+# 也就是系统分享面板 —— 那正是 Android 上「用外部应用打开」的形态。
+# 客户端是产线产物，改动面控制在这一行判断上，不动渲染与文案。
+# 已知残留（本轮不改，属文案）：卡片状态会沿用 presented.revealed
+# （「已请求在文件管理器中显示」），在 Android 上实际是拉起分享面板。
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """			return typeof host.name === "string" && typeof host.available === "boolean" && (host.fileManager === null || host.fileManager === "finder" || host.fileManager === "explorer" || host.fileManager === "directory");
+""",
+    """			/* "android" is a real answer, not a malformed one: there is no desktop file manager,
+			 * but open and reveal both reach the system share sheet (dsh-open -> /device/open),
+			 * so leaving it out of this whitelist turned every delivery card into
+			 * presented.hostError with a retry button that could never succeed. */
+			return typeof host.name === "string" && typeof host.available === "boolean" && (host.fileManager === null || host.fileManager === "finder" || host.fileManager === "explorer" || host.fileManager === "directory" || host.fileManager === "android");
+""",
+    '"android" is a real answer, not a malformed one',
+    "P29 交付卡片认 android 的 fileManager（否则恒 hostError）",
+)
+
+
+# ── P30: 同一个坑的另一处 —— 会话日志的发布锁（P3-helper）也只看 pid ──────────
+# 本轮验证 P28 时顺手在这份文件里查「EPERM 当存活」的同类判据，发现 publishExclusive()
+# （P3-helper，本项目自己加的）里还有一份：
+#     process.kill(holder, 0) 成功 -> 活；catch 里 EPERM -> 活
+# 危害比租约小（发布锁只在一次 rename 发布期间存在），但同样是「pid 被回收后
+# 永久没人破」：`.publish.lock` 一直留在日志旁边，之后每次 materialize 都会在
+# 500ms 后走 `return false`（当成「别人先到」），新会话的日志就再也建不出来。
+#
+# 修法与 P28 同源、但**更保守**：只有 /proc 证明「这个 pid 已经是另一个进程」时才破，
+# 其余不确定情形一律维持原判（EPERM 仍算活）。不加任何按年龄抢占 —— 抢一个活着的
+# 发布者就是在同一份日志上交错两个写者。新建锁时顺带把 starttime 写在 pid 后面，
+# 第一段仍是纯整数，旧版本照样按 pid 解析。
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """			try {
+				await handle.writeFile(String(process.pid));
+			} catch {
+			}
+""",
+    """			try {
+				/* pid plus this process's kernel identity, so a later publisher can tell "the
+				 * same writer" from "a stranger the kernel handed this pid to". The first token
+				 * stays a bare integer: older builds parse this file as a pid. */
+				const start = await readProcessStartTime(process.pid);
+				await handle.writeFile(start === undefined ? String(process.pid) : `${process.pid} ${start}`);
+			} catch {
+			}
+""",
+    "await handle.writeFile(start === undefined ? String(process.pid) :",
+    "P30a 发布锁写入身份 token（pid + starttime）",
+)
+patch(
+    "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+    """				let holder = 0;
+				try {
+					holder = Number.parseInt((await readFile(lock, "utf8")).trim(), 10) || 0;
+				} catch {
+					holder = 0;
+				}
+				let alive = false;
+				if (holder > 0) {
+					try {
+						process.kill(holder, 0);
+						alive = true;
+					} catch (probe) {
+						/* EPERM means the process exists but belongs to someone else. */
+						alive = probe?.code === "EPERM";
+					}
+				}
+""",
+    """				let holder = 0;
+				let start = 0;
+				try {
+					const fields = (await readFile(lock, "utf8")).trim().split(" ");
+					holder = Number.parseInt(fields[0] ?? "", 10) || 0;
+					start = Number.parseInt(fields[1] ?? "", 10) || 0;
+				} catch {
+					holder = 0;
+					start = 0;
+				}
+				/* Same judgement as the session write lease (P28): a pid is not an identity, and
+				 * `EPERM` used to read as "alive" here as well, so a lock whose pid the kernel
+				 * recycled belonged to a stranger that nobody could ever break. Only a proven
+				 * recycled pid is broken -- every unclear answer keeps the lock, because
+				 * expropriating a live publisher interleaves two writers over one log. */
+				let alive = false;
+				if (holder > 0) {
+					const recordedStart = start > 0 ? String(start) : undefined;
+					const currentStart = recordedStart === undefined ? undefined : await readProcessStartTime(holder);
+					if (recordedStart !== undefined && currentStart !== undefined) alive = currentStart === recordedStart;
+					else alive = probeProcess(holder) !== "gone";
+				}
+""",
+    "const recordedStart = start > 0 ? String(start) : undefined;",
+    "P30b 发布锁判活也看身份（EPERM 不再单独等于存活）",
+)
+
+
+# ── P31: 图片类型只认浏览器给的 MIME，Android 截图被当成「不是图片」 ──────────
+# 现场（真机）：选手机截图（1200×2608，内容正常）发送 → 界面报
+#   「仅支持 PNG、JPG、WebP、GIF 格式的图片」（locale key image.unsupportedType）。
+# 判定链全在客户端；服务端只做「声明的 mediaType 必须是四种之一」+「字节识别结果
+# 必须等于声明的 mediaType」，并没有另一套格式白名单可放宽：
+#   a) intakeFiles（输入框的收文件闸门）→ addFiles → createDrafts 用
+#      isImageMediaType(file.type) 决定「图片草稿 / 普通文件上传」；
+#   b) encodeImage → imageMediaType(file.type)，把类型写进 wire 的 mediaType；
+#   c) 服务端入库时 dsh-attachment-local/inspectMetadata 用 sharp 按**字节**识别，
+#      与声明的 mediaType 不等就抛 IMAGE_TYPE_MISMATCH，客户端把 INVALID_IMAGE /
+#      IMAGE_TYPE_MISMATCH 都渲染成同一句 image.unsupportedType。
+# Android 的相册/文件选择器给出空 type（或 application/octet-stream）时，三层都
+# 只有「浏览器给的字符串」这一个信息源，而那个字符串在 Android 上不可信。
+# 修法：只有 type 不在四个里时才读前 12 字节按 magic 判；认出来就把这个类型补到
+#   File 上，让 a/b 两层都用它（否则 b 层送出去的 mediaType 仍是空/八位字节流，
+#   服务端按字节复核还是会拒）。认不出原样保留：普通文件照旧走文件上传路径，
+#   真被当成图片时 encodeImage 仍抛原来的 UnsupportedImageMediaTypeError。
+# 快路径保留：type 已在四个里就直接返回，一个字节都不读（有测试守这条）。
+# 服务端不改：它接受的就是这四个值，我们只会送检测出来的这四个之一。
+patch(
+    "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+    """		function isImageMediaType(value) {
+			return value === "image/png" || value === "image/jpeg" || value === "image/webp" || value === "image/gif";
+		}
+""",
+    """		function isImageMediaType(value) {
+			return value === "image/png" || value === "image/jpeg" || value === "image/webp" || value === "image/gif";
+		}
+		/**
+		 * Android's picker hands the browser an empty `type` -- or
+		 * `application/octet-stream` -- for perfectly valid images, so a draft that
+		 * trusted the declared MIME alone refused a plain screenshot as an
+		 * unsupported type. Twelve bytes are enough to let the signature decide; a
+		 * declared type that is already accepted stays the fast path and reads
+		 * nothing at all.
+		 */
+		const IMAGE_HEAD_BYTES = 12;
+		/**
+		 * Identify the supported image format of one file signature.
+		 * @param bytes - the first 12 bytes of the file.
+		 * @returns the detected media type, or undefined for any other bytes.
+		 */
+		function mediaTypeFromImageHeader(bytes) {
+			const length = bytes.length;
+			if (length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
+			if (length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+			if (length >= 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
+			if (length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+			return void 0;
+		}
+		/**
+		 * Media type of one browser file: the declared type when it is one of the
+		 * accepted four, otherwise the type its own signature declares.
+		 * @param file - the browser file (Blob-shaped; only `slice` is relied on).
+		 * @returns the media type, or undefined when neither source identifies one.
+		 */
+		async function resolveImageMediaType(file) {
+			if (isImageMediaType(file.type)) return file.type;
+			let head;
+			try {
+				head = new Uint8Array(await file.slice(0, IMAGE_HEAD_BYTES).arrayBuffer());
+			} catch {
+				return void 0;
+			}
+			return mediaTypeFromImageHeader(head);
+		}
+		/**
+		 * The same file carrying the media type its own signature declares, so every
+		 * later consumer agrees: `createDrafts` picks the image draft path from
+		 * `File.type`, `imageLimits` counts images by it, and `encodeImage` writes it
+		 * on the wire as the mediaType the host re-checks against the bytes.
+		 * @param file - the browser file.
+		 * @returns the original file, or a re-typed view of it when detection won.
+		 */
+		async function adoptImageMediaType(file) {
+			const mediaType = await resolveImageMediaType(file);
+			if (mediaType === void 0 || mediaType === file.type) return file;
+			return new File([file], file.name, {
+				type: mediaType,
+				lastModified: file.lastModified
+			});
+		}
+		/**
+		 * Wire media type of one image file. An unidentifiable file throws the same
+		 * error the declared-type whitelist threw, so its rejection is unchanged.
+		 * @param file - the browser file.
+		 * @returns the media type its declaration or its bytes select.
+		 */
+		async function imageMediaTypeOf(file) {
+			const mediaType = await resolveImageMediaType(file);
+			if (mediaType === void 0) throw new UnsupportedImageMediaTypeError(file.type);
+			return mediaType;
+		}
+""",
+    "Android's picker hands the browser an empty",
+    "P31a 图片类型：空/未知 MIME 按 magic 判（12 字节）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+    """			async encodeImage(file) {
+				return {
+					mediaType: imageMediaType(file.type),
+""",
+    """			async encodeImage(file) {
+				return {
+					mediaType: await imageMediaTypeOf(file),
+""",
+    "mediaType: await imageMediaTypeOf(file)",
+    "P31b 上传用的 mediaType 跟着检测结果走（不然服务端按字节复核仍会对不上）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+    """			const intakeFiles = (0, react.useCallback)((files, directories) => {
+				if (locked || machineBusy || subagent !== null && !continuable || addFiles === void 0 || files.length === 0) return;
+""",
+    """			const intakeFiles = (0, react.useCallback)(async (files, directories) => {
+				if (locked || machineBusy || subagent !== null && !continuable || addFiles === void 0 || files.length === 0) return;
+				/* Everything below classifies synchronously from `File.type` -- `addFiles`
+				 * starts the image draft path, the limits count images, the continuable gate
+				 * rejects non-images -- so the picker's wrong MIME is corrected once, here,
+				 * before any of them runs. Nothing is read when the type is already good. */
+				const adopted = await Promise.all(files.map(adoptImageMediaType));
+				if (adopted.some((file, index) => file !== files[index])) {
+					if (directories !== void 0) directories = new Set([...directories].map((entry) => adopted[files.indexOf(entry)] ?? entry));
+					files = adopted;
+				}
+""",
+    "const adopted = await Promise.all(files.map(adoptImageMediaType));",
+    "P31c 收文件闸门先补类型（addFiles / 数量限制 / 可续会话判据都读 File.type）",
+)
+
+# ── P32: 载荷里的纯 JS sharp 解不开真机拍的 JPEG（相机 / MIUI 截图）────────────
+# 现场（真机 1.0.20-beta1）：相机照片和 MIUI 截图发不出去，界面报
+#   「仅支持 PNG、JPG、WebP、GIF 格式的图片」；PNG 截图正常。
+# 上一轮（report-p31-ineffective.md）已确认 P31 没问题、文案来自 host 侧：
+#   dsh-attachment-local 的 inspectMetadata → detectImage 会真的把整张图解码一遍
+#   （metadata + raw().toBuffer()），用的是载荷里手工换上的纯 JS sharp
+#   （0.35.5-purejs，原版在旁路 sharp.glibc-original）。它抛错就变成
+#   INVALID_IMAGE，客户端再把 INVALID_IMAGE 渲染成 image.unsupportedType，
+#   于是「解码器解不开」被说成「类型不支持」，误导了两轮排查。
+#
+# 实测（真机样张，直接调宿主 prepareImageFile）：
+#   小米相机 3072×4096/4096×3072 → INVALID_IMAGE cause=JPEG: missing quantisation table 1
+#   MIUI 截图 1200×2608/2608×1200（DRI=75/163）→ INVALID_IMAGE cause=JPEG: invalid Huffman code in entropy data
+#   同一批文件 ImageMagick/libjpeg 全部正常解码 → 文件没问题，是解码器的两个 bug：
+#
+# A. DQT 段只读了第一张表。小米相机把 tq=0（亮度）和 tq=1（色度）塞进**同一个**
+#    DQT 段（段长 130 = 2 + 2×(1+64)），旧代码只 buildQuantTable(seg) 一次，
+#    tq=1 永远没注册 → 扫描开始时 "missing quantisation table 1"。
+# B. restart 边界没有强制重同步。旧 BitReader.restart() 只在「reader 恰好已经
+#    撞见 RST 标记」时才跳过它；如果某个 restart 区间的最后一个 MCU 正好落在
+#    字节边界上，reader 从没 peek 过标记，于是复位被跳过、FF D0-D7 被当成熵
+#    数据喂进 Huffman 解码器 → "invalid Huffman code in entropy data"。
+#    本机 2178 个基线 JPEG 里有 884 个带 DRI，这条不修等于四成的图发不出去。
+#
+# 验证（16 张真机样张，修前/修后都跟 libjpeg 逐像素比）：
+#   修前 14/16 FAIL，修后 16/16 OK，与 libjpeg 的 MAE 0.01-0.32（只是 IDCT/上采样
+#   的取整差），12 个无 DRI 文件的解码结果与修前**逐字节相同**（没有回归）。
+patch(
+    "sharp/jpeg.js",
+    """    if (marker === 0xdb) {
+      const q = buildQuantTable(seg);
+      quantTables[q.tq] = q.table;
+    } else if (marker === 0xc4) {
+""",
+    """    if (marker === 0xdb) {
+      /* P32a: one DQT segment may carry *every* quantisation table. Xiaomi's camera puts
+       * luma (tq=0) and chroma (tq=1) into a single 128-byte segment, so reading seg[0]
+       * alone left tq=1 unregistered and the scan died with "missing quantisation table 1"
+       * -- on a file libjpeg decodes fine. Walk the whole segment instead: one pq/tq byte,
+       * then 64 (8-bit) or 128 (16-bit) values per table. */
+      let qoff = 0;
+      while (qoff < seg.length) {
+        const tableBytes = (seg[qoff] >> 4) === 1 ? 128 : 64;
+        if (qoff + 1 + tableBytes > seg.length) throw new Error('JPEG: truncated quantisation table segment');
+        const q = buildQuantTable(seg.subarray(qoff));
+        quantTables[q.tq] = q.table;
+        qoff += 1 + tableBytes;
+      }
+    } else if (marker === 0xc4) {
+""",
+    "P32a: one DQT segment may carry",
+    "P32a DQT 段逐表读完（小米相机把两张表塞进同一个 DQT 段）",
+)
+patch(
+    "sharp/jpeg.js",
+    """  /** Drop the partial byte and skip a restart marker if one is pending. */
+  restart() {
+    this.bitCnt = 0;
+    this.bitBuf = 0;
+    if (this.marker) {
+      const m = this.marker;
+      this.marker = 0;
+      this.pos += 2;
+      this.eof = false;
+      void m;
+      return true;
+    }
+    return false;
+  }
+""",
+    """  /**
+   * P32b: drop the padding bits and consume the RSTn marker that must sit at the next byte
+   * boundary. The encoder pads the last byte of an interval with 1-bits and then writes
+   * FF D0-D7, but whether fill() already peeked at that marker depends on where the last
+   * MCU happened to end. When it ended exactly on the byte boundary nothing was ever
+   * peeked, the old code skipped the resync entirely, and the marker bytes were handed to
+   * the Huffman decoder as entropy data -- "invalid Huffman code in entropy data" on every
+   * MIUI screenshot (DRI 75/163) and on camera frames that carry a DRI.
+   * Returns the consumed marker number, or 0 when no marker was found.
+   */
+  restart() {
+    this.bitCnt = 0;
+    this.bitBuf = 0;
+    if (this.marker) {
+      const m = this.marker;
+      this.marker = 0;
+      this.pos += 2; // fill() backed up to the 0xFF, so neither marker byte was consumed
+      this.eof = false;
+      return m;
+    }
+    let p = this.pos;
+    // Repeated 0xFF bytes before a marker are legal fill bytes, not entropy data.
+    while (p + 1 < this.data.length && this.data[p] === 0xff && this.data[p + 1] === 0xff) p++;
+    if (p + 1 < this.data.length && this.data[p] === 0xff && this.data[p + 1] >= 0xd0 && this.data[p + 1] <= 0xd7) {
+      const m = this.data[p + 1];
+      this.pos = p + 2;
+      this.eof = false;
+      return m;
+    }
+    return 0;
+  }
+""",
+    "P32b: drop the padding bits and consume the RSTn marker",
+    "P32b restart 边界强制字节对齐并吃掉 FF D0-D7（只有 peek 到标记才跳的老逻辑）",
+)
+patch(
+    "sharp/jpeg.js",
+    """  for (mcuIndex = 0; mcuIndex < totalMcus; mcuIndex++) {
+    if (resetInterval && mcuIndex > 0 && mcuIndex % resetInterval === 0) {
+      if (br.restart()) {
+        for (const c of scanComponents) c.pred = 0;
+        eobrun = 0;
+      }
+    }
+""",
+    """  for (mcuIndex = 0; mcuIndex < totalMcus; mcuIndex++) {
+    if (resetInterval && mcuIndex > 0 && mcuIndex % resetInterval === 0) {
+      /* P32b: the interval ends here whether or not the reader ever peeked at the marker,
+       * so the resync must not be conditional: byte-align, consume RSTn, then reset the DC
+       * predictors and the EOB run -- that is the whole point of a restart interval
+       * (T.81 F.2.2.4 / G.1.2.3). Dn is accepted as-is: those numbers are interchangeable
+       * for decoding, and a few encoders restart the counter on every scan. */
+      br.restart();
+      for (const c of scanComponents) c.pred = 0;
+      eobrun = 0;
+    }
+""",
+    "P32b: the interval ends here whether or not the reader ever peeked",
+    "P32b 每个 restart 边界无条件复位 DC 预测 / EOB run",
+)
+
+# ── P33: 「解码失败」和「类型不支持」共用一句文案，把人往错的地方带 ────────────
+# 上一轮排查最大的误导源：host 的 INVALID_IMAGE（解码器说这张图不合法）和客户端
+# 自己的类型白名单拒绝（image.unsupportedType）显示的是**一模一样**的一句话，
+# 于是「相机照片类型正确也报这句」看起来像客户端闸门坏了，实际是解码器。
+# 这里只改文案映射，不动任何校验：解码失败单独一句、中英文都补；类型不支持
+# 保持原句（它才是真的在说支持哪四种格式）。IMAGE_TYPE_MISMATCH 仍归到类型那句
+# —— 声明类型和字节对不上，用户能做的还是「换一张/重选」。
+patch(
+    "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+    """			"image.unsupportedType": "仅支持 PNG、JPG、WebP、GIF 格式的图片",
+""",
+    """			"image.unsupportedType": "仅支持 PNG、JPG、WebP、GIF 格式的图片",
+			"image.decodeFailed": "图片解码失败（格式异常），请换一张图或重新导出后再试",
+""",
+    "图片解码失败（格式异常）",
+    "P33a 解码失败的中文文案（与「类型不支持」分开）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+    """			"image.unsupportedType": "Only PNG, JPG, WebP, and GIF images are supported",
+""",
+    """			"image.unsupportedType": "Only PNG, JPG, WebP, and GIF images are supported",
+			"image.decodeFailed": "Image could not be decoded (unexpected format); try another image or re-export it",
+""",
+    "Image could not be decoded (unexpected format)",
+    "P33b 解码失败的英文文案",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+    """				case "INVALID_IMAGE":
+				case "IMAGE_TYPE_MISMATCH": return t("image.unsupportedType");
+""",
+    """				/* P33: a decode failure and a type rejection used to share one sentence, so a
+				 * camera JPEG the host decoder choked on was reported as "only PNG/JPG/WebP/GIF
+				 * are supported" -- which is exactly what sent the last investigation after the
+				 * wrong gate. Say which of the two actually happened. */
+				case "INVALID_IMAGE": return t("image.decodeFailed");
+				case "IMAGE_TYPE_MISMATCH": return t("image.unsupportedType");
+""",
+    'case "INVALID_IMAGE": return t("image.decodeFailed");',
+    "P33c INVALID_IMAGE 改用解码失败文案（IMAGE_TYPE_MISMATCH 保持类型那句）",
+)
+
 # ── 必成清单：没落地就不是"少个功能"，而是产物直接不可用 ────────────────────
 # patch() 的失败默认只是记一行「跳过」，脚本照样退出 0 —— 以前正是这样让坏产物
 # 一路走到打包。这里列出「缺了就废」的条目：只要它不是"已打过"，就以非 0 退出。
@@ -1809,6 +2605,71 @@ MUST_APPLY = {
         "内核低于 Chrome 100 的设备上，客户端在 import 阶段就抛 "
         "\"x is not a function\"，页面永远停在「重新连接中」——"
         "服务器明明在跑，用户却完全用不了",
+    # P27：Android 拒绝硬链接，附件发布整条链路死。图片与非图片各一条，
+    # 少一条就是「图片能发、txt 不能发」这种更难查的半死状态。
+    "P27a 附件对象发布：link 被拒时回落 rename":
+        "Android 的 app 私有存储对 link(2) 回 EACCES，图片收发与 agent 读图全部失败"
+        "（ATTACHMENT_WRITE_FAILED / 「Unable to persist attachment.」）",
+    "P27b 附件别名发布：link 被拒时读字节再写（不能 rename）":
+        "非图片文件（txt/pdf/zip）走 publishImmutableAlias，同一限制下仍然 "
+        "ATTACHMENT_WRITE_FAILED —— 修好图片会让人以为「只剩图片能发」",
+    "P27c alias 回落的 EEXIST 接回 digest 去重":
+        "同一份文件发第二次（或重试）会撞上内容寻址的 target，copy 的 wx 直接抛 "
+        "EEXIST → 又变成 ATTACHMENT_WRITE_FAILED（容器验证抓到的新回归）",
+    # P28：僵尸租约会永久锁死一个会话（session/writer-held），且用户只能手工删目录。
+    # P28a/b/c/e/f 是代码；P28d/P28g 只动注释，不进必成清单。
+    "P28a 租约增加身份记录文件名与超时接管阈值":
+        "P28 其余条目引用的 LEASE_START_FILENAME / LEASE_TAKEOVER_MS 不存在 → "
+        "建租约时 ReferenceError，任何会话都写不进去",
+    "P28b 判活改看 pid + /proc starttime 身份（EPERM 不再等于存活）":
+        "EPERM 仍被当成「还活着」→ pid 被复用时租约永久不破，"
+        "该会话冷启动后照样打不开（session/writer-held）",
+    "P28c 读租约记录（pid + 身份 + 年龄）":
+        "createLeaseDirectory 没有可用的 holder 记录 → 判活抛 ReferenceError，会话打不开",
+    "P28e 接管判据：身份/超时，破锁前复核 pid + 身份 + inode":
+        "接管逻辑没落地 → 僵尸租约只能手工 rm；落地了但不复核，"
+        "又会误删接替者刚建的新租约（两个写者）",
+    "P28f 建租约时写入身份 token":
+        "新租约不记 starttime → 下游全退化成「不可识别、等 30 分钟」，"
+        "用户报的那种锁死要等半小时才自愈",
+    # P30：同一个坑在发布锁里（查 P28 时发现的另一处，也是本项目自己的代码）。
+    "P30a 发布锁写入身份 token（pid + starttime）":
+        "发布锁只记 pid，pid 被回收后没人能证明它不是原持有者",
+    "P30b 发布锁判活也看身份（EPERM 不再单独等于存活）":
+        "pid 被别的 uid 复用时 EPERM 被当成「还活着」→ `.publish.lock` 永久留在日志旁，"
+        "之后每次 materialize 都在 500ms 后当成「别人先到」，新会话的日志再也建不出来",
+    # P31：客户端三条判据共用同一份「浏览器给的 MIME」，少一条都不成：
+    #   没有 a → b/c 引用不存在的函数，整个客户端 bundle 在调用处 ReferenceError；
+    #   有 a 没 b → 判断放宽了但上传的 mediaType 还是空 → 服务端按字节复核对不上；
+    #   有 a/b 没 c → 闸门仍按空 type 把它当普通文件，图片路径根本没进。
+    "P31a 图片类型：空/未知 MIME 按 magic 判（12 字节）":
+        "Android 选择器给出空 type/octet-stream 时，截图被当成「不是图片」，"
+        "用户看到「仅支持 PNG、JPG、WebP、GIF 格式的图片」而内容其实是 PNG",
+    "P31b 上传用的 mediaType 跟着检测结果走（不然服务端按字节复核仍会对不上）":
+        "只改判断不改 wire 字段 → 服务端 inspectMetadata 用 sharp 按字节识别，"
+        "与声明的 mediaType 不等就抛 IMAGE_TYPE_MISMATCH，界面还是同一句错",
+    "P31c 收文件闸门先补类型（addFiles / 数量限制 / 可续会话判据都读 File.type）":
+        "闸门不同步补类型 → 空 type 的截图走普通文件上传，图片草稿路径不触发，"
+        "「按内容判图」等于没接上",
+    # P32：真机上的图片发不出去，根因在 host 侧解码（不是 P31 那条客户端闸门）。
+    # P32a/P32b 各修一类 JPEG；A 管相机，B 管带 restart interval 的（本机 884/2178）。
+    "P32a DQT 段逐表读完（小米相机把两张表塞进同一个 DQT 段）":
+        "只读第一张表 → tq=1 未注册 → 相机 JPEG 全部 INVALID_IMAGE"
+        "（cause=JPEG: missing quantisation table 1），真机相机照片一张都发不出去",
+    "P32b restart 边界强制字节对齐并吃掉 FF D0-D7（只有 peek 到标记才跳的老逻辑）":
+        "restart 边界不重同步 → 标记被当熵数据 → 带 DRI 的 JPEG 全部"
+        "INVALID_IMAGE（cause=JPEG: invalid Huffman code in entropy data）",
+    "P32b 每个 restart 边界无条件复位 DC 预测 / EOB run":
+        "复位依赖 br.restart() 的返回值 → 没 peek 到标记时预测器不复位，"
+        "就算不抛错也是错像素（T.81 要求每个区间边界都复位）",
+    # P33 只影响文案，但缺了解码失败就又说成「类型不支持」，下一个人还得再查一轮。
+    "P33a 解码失败的中文文案（与「类型不支持」分开）":
+        "解码失败仍显示「仅支持 PNG、JPG、WebP、GIF」，"
+        "看起来像类型白名单拒绝，把排查带偏",
+    "P33b 解码失败的英文文案":
+        "英文界面同样只有一句 unsupportedType，解码失败无法与类型问题区分",
+    "P33c INVALID_IMAGE 改用解码失败文案（IMAGE_TYPE_MISMATCH 保持类型那句）":
+        "映射不拆 → 新加的中英文文案永远显示不出来",
 }
 # 光记账不够：note 误命中（本脚本栽过三次）会让条目报「已打过」而其实没改。
 # 所以必成条目还要对着落盘结果验一遍。
@@ -1830,6 +2691,124 @@ MUST_STATE = [
         "Promise.withResolvers !== 'function'",
         "polyfill 段里的 withResolvers 守卫必须真的在",
         "只匹配到注释、没匹配到实现，等于没打",
+    ),
+    # P27 落盘形态：两处回落必须**不同**，抄错的典型是给 alias 也上 rename。
+    (
+        "@deepseek-ai/dsh-attachment-local/lib/index.js",
+        "if (!stagedConsumed) await unlink(staged.path);",
+        "publishStagedObject 必须有 rename 回落（stagedConsumed 置位的那个分支）",
+        "缺了它图片发布仍然 EACCES → 全部附件收发失败（Issue #4）",
+    ),
+    (
+        "@deepseek-ai/dsh-attachment-local/lib/index.js",
+        "await writeFile(target, await readFile(source), { mode: 384, flag: \"wx\" });",
+        "publishImmutableAlias 的回落必须是「读字节再写」，不是 rename",
+        "写成 rename 会把 canonical object 搬走 —— 别的 alias 指向空，"
+        "或更糟：文件在别处丢了内容",
+    ),
+    (
+        "@deepseek-ai/dsh-attachment-local/lib/index.js",
+        "if (copyCode !== \"EEXIST\") throw copyError;",
+        "alias 回落的 copy 必须把 EEXIST 接回 digest 去重（P27c）",
+        "不接的话，同一个文件发第二次会在 Android 上报 ATTACHMENT_WRITE_FAILED",
+    ),
+    # P28 落盘形态：三符号 + 身份 token 的写入点。
+    (
+        "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+        "const LEASE_START_FILENAME = \"start\";",
+        "租约必须有身份记录文件名（P28a）",
+        "没有它，判活回退成只看 pid —— 就是被 EPERM 卡死的那个 bug",
+    ),
+    (
+        "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+        "async function leaseHolderVerdict(record) {",
+        "租约判活必须走 leaseHolderVerdict（P28b）",
+        "缺了它 isProcessAlive 的 EPERM 分支还在，僵尸租约照旧",
+    ),
+    (
+        "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+        "await writeFile(join(dir, LEASE_START_FILENAME), start);",
+        "建租约时必须写下 starttime 身份（P28f）",
+        "不写 token，所有租约都只能按 30 分钟超时接管，等于把修复等到超时",
+    ),
+    # P30 落盘形态：发布锁也必须记身份、也必须按身份判活。
+    (
+        "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+        "const recordedStart = start > 0 ? String(start) : undefined;",
+        "发布锁判活必须看身份（P30b）",
+        "只看 pid 的话，pid 被回收后 `.publish.lock` 永久不破，新会话的日志建不出来",
+    ),
+    (
+        "@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
+        "const start = await readProcessStartTime(process.pid);",
+        "发布锁必须写下 starttime（P30a）",
+        "不写身份，P30b 永远走「不可识别、维持原判」，僵尸锁照旧",
+    ),
+    # P29 落盘形态：客户端白名单。这条不进 MUST_APPLY（卡片文案级，
+    # 缺了不会让产物不可用），但落盘要能一眼看出有没有打上。
+    (
+        "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+        "host.fileManager === \"android\"",
+        "客户端 isPresentedHost 必须认 android（P29）",
+        "不认的话服务端答得再对，卡片也只显示「无法读取主机桌面信息 · 重试」",
+    ),
+    # P31 落盘形态：magic 判图要在，且三条接点都要真的接上。
+    (
+        "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        "function mediaTypeFromImageHeader(bytes) {",
+        "客户端必须能按 magic 判图（P31a）",
+        "没有它，选择器给空 type 的截图仍然被判成「不支持的类型」",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        "mediaType: await imageMediaTypeOf(file)",
+        "上传的 mediaType 必须取检测结果（P31b）",
+        "取 file.type 的话空 type 仍然是空/抛错，服务端按字节复核也过不去",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        "const adopted = await Promise.all(files.map(adoptImageMediaType));",
+        "收文件闸门必须先补类型（P31c）",
+        "闸门按旧 type 分类，截图会走普通文件上传，图片路径不触发",
+    ),
+    # P32 落盘形态：两个解码 bug 各一条，外加「边界无条件复位」这条——
+    # 只改 restart() 不改 decodeScan，标记会被吃掉但预测器不复位（错像素）。
+    (
+        "sharp/jpeg.js",
+        "let qoff = 0;",
+        "DQT 段必须逐表读完（P32a）",
+        "只读首表的话，小米相机那种「两张表一个段」的文件仍然 missing quantisation table 1",
+    ),
+    (
+        "sharp/jpeg.js",
+        "const m = this.data[p + 1];",
+        "restart 边界必须自己找 RST 标记（P32b）",
+        "依赖 fill() 先撞见标记的话，字节对齐的边界仍会把 FF D0-D7 当熵数据",
+    ),
+    (
+        "sharp/jpeg.js",
+        "      br.restart();\n      for (const c of scanComponents) c.pred = 0;",
+        "每个 restart 边界无条件复位预测器（P32b）",
+        "复位挂在返回值上时，没撞见标记的边界不会清 DC 预测，解出来是错像素",
+    ),
+    # P33 落盘形态：两条文案 + 新的映射。中英文都要在，且映射要真的指向新键。
+    (
+        "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        "\"image.decodeFailed\": \"图片解码失败（格式异常）",
+        "中文要有「解码失败」文案（P33a）",
+        "缺了这条，解码失败只能借用「仅支持 PNG/JPG/WebP/GIF」那句",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        "\"image.decodeFailed\": \"Image could not be decoded",
+        "英文要有「解码失败」文案（P33b）",
+        "英文界面会退回显示 key 本身或沿用 unsupportedType",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
+        "case \"INVALID_IMAGE\": return t(\"image.decodeFailed\");",
+        "INVALID_IMAGE 必须映射到解码失败文案（P33c）",
+        "映射没拆的话，两条新文案都显示不出来，用户看到的还是那句误导人的话",
     ),
 ]
 
