@@ -2593,6 +2593,121 @@ patch(
     "P33c INVALID_IMAGE 改用解码失败文案（IMAGE_TYPE_MISMATCH 保持类型那句）",
 )
 
+# ── P34: Android 上没有「在文件管理器中显示」的落点 —— 这个动作要隐藏，不是置灰 ──
+# 现场（Issue #4 第 7 条，1.0.20 只修好一半）：卡片渲染正常了（P29 让客户端认
+# fileManager "android"），点卡片本体也能预览；但点「显示文件位置」/文件夹图标仍然
+# toast「无法显示文件位置，请重试」+ 卡片红字「无法在文件管理器中显示，请重试」。
+# 底层 GET /device/open?path=… 返回 200 并弹出系统分享面板 —— 说明「打开」这条已经
+# 落到 dsh-open，缺的是 reveal 在 Android 上根本没有落点：没有文件管理器可开，
+# App 也没有 reveal intent。P15b 把 reveal 也接去 dsh-open 只能拉起分享面板，
+# 语义不对，失败时还照样按 revealError 报错。
+# 选择（用户定的方案 1）：Android 上**不渲染** reveal，只保留「打开」。
+# 置灰不算修 —— 一个永远点不动的按钮比没有这个按钮更糟。
+#
+# 动作到底在哪渲染（读代码的结论，不是猜的）：
+#   dsh-client-ui-deliverables  只把 actions 交给插槽：
+#       renderSlot("deliverables.file.actions", { actionUrl, available, pending, onAction })
+#   dsh-client-ui-open-in-app    插槽的渲染方 FileRouteAction -> OpenTargetButton(kind:"file")：
+#       菜单项 = applications.map(「用 X 打开」) + footer 的 reveal；
+#       没有可用应用时 reveal 就是主按钮（桌面上那个文件夹图标）。
+# 所以 P34 只能是这两处的最小改动：
+#   a) deliverables 把 P29 已经拿到的判据（host.fileManager）作为 reveal:false 传下去；
+#   b) open-in-app 按这个标记**只**去掉 reveal 那一项：主按钮退回「打开」，
+#      应用列表、列表失败重试、chevron 都照旧。
+# 不在客户端新造探测（不看 UA、不看平台名）—— fileManager 是唯一判据。
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """							actions: renderSlot("deliverables.file.actions", {
+								actionUrl: presentedFileUrl(sessionId, file.seq, file.index),
+								available: host !== null && host !== "error" && host.available,
+""",
+    """							/* P34: android hides reveal -- host.fileManager is the judgement P29 already
+							 * established ("android" is a real answer, not a malformed one). There is no
+							 * file manager to reveal into on Android, and the App exposes no reveal intent,
+							 * so the slot is told to drop that one action instead of drawing a folder button
+							 * whose every click ends in revealError. Nothing else on the card changes. */
+							actions: renderSlot("deliverables.file.actions", {
+								actionUrl: presentedFileUrl(sessionId, file.seq, file.index),
+								available: host !== null && host !== "error" && host.available,
+								reveal: host === null || host === "error" ? true : host.fileManager !== "android",
+""",
+    'P34: android hides reveal',
+    "P34a 交付卡片把 fileManager 判据传给动作插槽（android 时 reveal:false）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			const hasMenu = props.loading === true || props.failed || applications.length + (kind === "file" ? 1 : 0) > 1;
+			const revealDefault = kind === "file" && preferred === void 0 && props.loading !== true;
+			const primaryLabel = preferred === void 0 ? t("path.reveal") : t("open.title", { app: preferred.name });
+""",
+    """			/* P34: android hides reveal -- callers pass reveal:false when the Host reports
+			 * fileManager "android". Only the reveal entry goes away: the application list,
+			 * its retry entry, and the plain "open" fallback keep rendering. */
+			const revealOffered = kind !== "file" || props.reveal !== false;
+			const hasMenu = props.loading === true || props.failed || applications.length + (kind === "file" && revealOffered ? 1 : 0) > 1;
+			const revealDefault = kind === "file" && revealOffered && preferred === void 0 && props.loading !== true;
+			const primaryLabel = preferred === void 0 ? t(revealOffered ? "path.reveal" : "path.open") : t("open.title", { app: preferred.name });
+""",
+    'P34: android hides reveal',
+    "P34b 渲染层：revealOffered 决定主按钮是「显示文件位置」还是「打开」，并把它计入菜单项数",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """				footer: kind === "file" ? [{
+					id: "reveal",
+""",
+    """				footer: kind === "file" && revealOffered ? [{
+					id: "reveal",
+""",
+    'footer: kind === "file" && revealOffered ? [{',
+    "P34c 菜单 footer 里的 reveal 项按 revealOffered 决定是否出现",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			const association = useFileApplications(props.actionUrl, queryRoute, props.available);
+			if (!props.available) return null;
+			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
+				kind: "file",
+				applications: association.apps,
+""",
+    """			const association = useFileApplications(props.actionUrl, queryRoute, props.available);
+			if (!props.available) return null;
+			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
+				kind: "file",
+				reveal: props.reveal !== false,
+				applications: association.apps,
+""",
+    'reveal: props.reveal !== false,',
+    "P34d 卡片动作把 reveal 标记交给渲染层（其它调用方不传 = 保持原样）",
+)
+
+# ── P34e: review 面板那处也没传 reveal —— 同一个插槽，同一个按钮 ────────────
+# beta1 的残留（Issue #4 第 7 条只修到卡片那处）：review 面板的动作插槽叫
+# deliverables.review.file.actions，渲染方仍是 open-in-app 的同一个 FileRouteAction
+# （client.js 里两个名字都注册到它），但 ReviewTab 只传了 actionUrl/available/
+# pending/onAction —— 没有 reveal。于是 open-in-app 的 props.reveal 是 undefined，
+# P34b 的 revealOffered 退化成 true，review 面板的主按钮照旧写「显示文件位置」，
+# 点下去还是同一个 revealError。用户报的「同一插槽」边界就是这里。
+# 判据与 P34a 同源：ReviewTab 顶部已经为 `native` 读过一次 host，这里直接用它，
+# 不在客户端新造探测。
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """										available: native,
+										pending: phase === "opening" || phase === "revealing",
+										onAction: (action, application) => openChanged(sessionId, seq, index, action, application)
+""",
+    """										available: native,
+										/* P34e: android hides reveal -- the review pane renders the same slot as the card, so it
+										 * takes the same judgement: host.fileManager is the Host's own answer, already read here
+										 * for `native`, and "android" means there is no file manager to reveal into. No probe. */
+										reveal: host === null || host === "error" ? true : host.fileManager !== "android",
+										pending: phase === "opening" || phase === "revealing",
+										onAction: (action, application) => openChanged(sessionId, seq, index, action, application)
+""",
+    "P34e: android hides reveal",
+    "P34e review 面板把同一判据传给同一个插槽（android 时 reveal:false）",
+)
+
 # ── 必成清单：没落地就不是"少个功能"，而是产物直接不可用 ────────────────────
 # patch() 的失败默认只是记一行「跳过」，脚本照样退出 0 —— 以前正是这样让坏产物
 # 一路走到打包。这里列出「缺了就废」的条目：只要它不是"已打过"，就以非 0 退出。
@@ -2670,6 +2785,21 @@ MUST_APPLY = {
         "英文界面同样只有一句 unsupportedType，解码失败无法与类型问题区分",
     "P33c INVALID_IMAGE 改用解码失败文案（IMAGE_TYPE_MISMATCH 保持类型那句）":
         "映射不拆 → 新加的中英文文案永远显示不出来",
+    # P34：Issue #4 第 7 条。缺任何一条都不是「少个按钮」，而是那个必然失败的
+    # 文件夹图标还在（或者主按钮还写着「显示文件位置」）。
+    "P34a 交付卡片把 fileManager 判据传给动作插槽（android 时 reveal:false）":
+        "卡片拿不到「这是 android」的判据 → reveal 照旧渲染，点一下还是那句话，"
+        "第 7 条等于没修",
+    "P34b 渲染层：revealOffered 决定主按钮是「显示文件位置」还是「打开」，并把它计入菜单项数":
+        "只藏菜单项、不换主按钮 → 没有可用应用的 Android 上主按钮仍写着"
+        "「显示文件位置」（文件夹图标），点一次错一次",
+    "P34c 菜单 footer 里的 reveal 项按 revealOffered 决定是否出现":
+        "菜单里还挂着 reveal → 收起状态看不到，展开菜单就又能点到，等于没隐藏",
+    "P34d 卡片动作把 reveal 标记交给渲染层（其它调用方不传 = 保持原样）":
+        "标记没传下去 → 渲染层永远按「有 reveal」走，前三条全白做",
+    "P34e review 面板把同一判据传给同一个插槽（android 时 reveal:false）":
+        "review 面板那处拿不到标记 → 主按钮仍写着「显示文件位置」，"
+        "点下去还是同一个错，第 7 条只修了卡片那一半",
 }
 # 光记账不够：note 误命中（本脚本栽过三次）会让条目报「已打过」而其实没改。
 # 所以必成条目还要对着落盘结果验一遍。
@@ -2809,6 +2939,40 @@ MUST_STATE = [
         "case \"INVALID_IMAGE\": return t(\"image.decodeFailed\");",
         "INVALID_IMAGE 必须映射到解码失败文案（P33c）",
         "映射没拆的话，两条新文案都显示不出来，用户看到的还是那句误导人的话",
+    ),
+    # P34 落盘形态：判据从卡片传到渲染层，且只挡 reveal 这一项（应用列表、
+    # 列表失败重试、主按钮的「打开」回落都要照旧）。
+    (
+        "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+        "reveal: host === null || host === \"error\" ? true : host.fileManager !== \"android\",",
+        "卡片必须按 fileManager 决定是否给 reveal（P34a）",
+        "不传这个标记，渲染层照旧画「显示文件位置」，Android 上点一次错一次",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        "const revealOffered = kind !== \"file\" || props.reveal !== false;",
+        "渲染层必须有 revealOffered 这一层判断（P34b）",
+        "没有它，主按钮在 Android 上仍然是「显示文件位置」",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        "reveal: props.reveal !== false,",
+        "卡片动作必须把 reveal 标记交给渲染层（P34d）",
+        "标记丢了等于前两条没接线",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        "footer: kind === \"file\" && revealOffered ? [{",
+        "菜单 footer 的 reveal 项必须跟 revealOffered 走（P34c）",
+        "菜单里留着 reveal，展开菜单仍然能点到那个必然失败的动作",
+    ),
+    # P34e 落盘形态：同一插槽的第二处调用也要带判据，且必须紧跟在 `available: native`
+    # 这行后面（review 面板与卡片传的 available 来源不同，位置本身就是证据）。
+    (
+        "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+        "available: native,\n\t\t\t\t\t\t\t\t\t\t/* P34e: android hides reveal",
+        "review 面板那处也必须把 fileManager 判据传给插槽（P34e）",
+        "不传的话 review 面板的主按钮仍是「显示文件位置」，点一次错一次",
     ),
 ]
 
