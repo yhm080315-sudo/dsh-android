@@ -3114,11 +3114,103 @@ patch(
     "P35c 英文 toast 文案：不再一律 Try again",
 )
 
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/index.js",
+    """? 404 : 500;
+}
+/**
+* Read the addressed event once the Host desktop is known to be available.
+""",
+    """? 404 : 500;
+}
+/**
+ * P36: resolve the path behind an open coordinate, naming the Android failure stage.
+ *
+ * `stat` is the workspace lookup that turns a card's recorded path into an absolute
+ * one. When the path is gone it throws, and the route catch used to answer 404 -- the
+ * card could only say "open failed, retry", because P35c's `missing` stage was only
+ * reachable after a successful stat. Name the stage here, before the native open runs.
+ * Desktop keeps the 404: that is its contract.
+ * @param stat - performs the workspace lookup and resolves to the entry.
+ * @returns the entry, or the 502 refusal to answer with.
+ */
+async function resolveAndroidOpenPath(ctx, request, action, stat) {
+	try {
+		return await stat();
+	} catch (statError) {
+		request.signal.throwIfAborted();
+		if (failureStatus(statError) !== 404 || ctx.sessionController.workspaceDesktop().fileManager !== "android") throw statError;
+		const detail = statError instanceof Error ? statError.message : String(statError);
+		console.warn("open-in-app: android " + action + " handoff failed (missing): " + detail);
+		return Response.json({
+			step: "android-open",
+			stage: "missing",
+			detail
+		}, {
+			status: 502,
+			headers: { "cache-control": "no-store" }
+		});
+	}
+}
+/**
+* Read the addressed event once the Host desktop is known to be available.
+""",
+    "P36: resolve the path behind an open coordinate, naming the Android failure stage",
+    "P36 打开前的 stat 在 Android 上回 502 missing（helper）",
+)
+
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/index.js",
+    """		request.signal.throwIfAborted();
+		const { absolutePath: path } = await ctx.workspaceFiles.stat({
+			sessionId: id,
+			workspaceRoot: session.cwd ?? ctx.sandboxPolicy.workspaceRoot
+		}, file.path, request.signal);
+		return await openVerified(ctx, request, path, action);
+""",
+    """		/* P36: the presented card -- name the missing stage before the open runs. */
+		const resolved = await resolveAndroidOpenPath(ctx, request, action, () => ctx.workspaceFiles.stat({
+			sessionId: id,
+			workspaceRoot: session.cwd ?? ctx.sandboxPolicy.workspaceRoot
+		}, file.path, request.signal));
+		if (resolved instanceof Response) return resolved;
+		return await openVerified(ctx, request, resolved.absolutePath, action);
+""",
+    "P36: the presented card -- name the missing stage before the open runs.",
+    "P36 交付卡片：文件被删时走 missing（presented）",
+)
+
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/index.js",
+    """		const { absolutePath: path } = await ctx.workspaceFiles.stat({
+			sessionId: id,
+			workspaceRoot
+		}, file.path, request.signal);
+		return await openVerified(ctx, request, path, action);
+""",
+    """		/* P36: the changes card -- the same missing stage, same coordinates shape. */
+		const resolved = await resolveAndroidOpenPath(ctx, request, action, () => ctx.workspaceFiles.stat({
+			sessionId: id,
+			workspaceRoot
+		}, file.path, request.signal));
+		if (resolved instanceof Response) return resolved;
+		return await openVerified(ctx, request, resolved.absolutePath, action);
+""",
+    "P36: the changes card -- the same missing stage, same coordinates shape.",
+    "P36 变更卡片：同一处理（changes）",
+)
+
 # ── 必成清单：没落地就不是"少个功能"，而是产物直接不可用 ────────────────────
 # patch() 的失败默认只是记一行「跳过」，脚本照样退出 0 —— 以前正是这样让坏产物
 # 一路走到打包。这里列出「缺了就废」的条目：只要它不是"已打过"，就以非 0 退出。
 # 「已打过」是合法的（第二遍复验就是这个状态），所以只拦 missing / anchor。
 MUST_APPLY = {
+    "P36 打开前的 stat 在 Android 上回 502 missing（helper）":
+        "helper 不在 → 卡片打开被删文件仍走 404，界面只会说「打开失败，点击重试」",
+    "P36 交付卡片：文件被删时走 missing（presented）":
+        "交付卡片（issue #4 ③）仍显示「打开失败，点击重试」而不是「文件已不在原路径」",
+    "P36 变更卡片：同一处理（changes）":
+        "变更卡片上的「打开」对已删除文件仍是通用文案（同一缺陷的第二处）",
     "P25 fs/promises import 补 rename/copyFile/writeFile（P3a/P16d 要用，上游没有）":
         "新建会话第一次发布日志就抛 ReferenceError: rename is not defined，"
         "它非 LlmError，被包成 TRANSPORT 重试 5 次 —— 表现成「新会话发不出消息」",
