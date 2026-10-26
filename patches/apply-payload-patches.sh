@@ -2708,6 +2708,412 @@ patch(
     "P34e review 面板把同一判据传给同一个插槽（android 时 reveal:false）",
 )
 
+# ── P35: 预览页的 reveal 仍在 / Android 的「打开」失败说不清是哪一步 ─────────
+# Issue #4 第二轮（1.0.21 验完）报的两处，加上一条同族的静默失败：
+#   a) dsh-client-ui-open-in-app 的 FileOpenTarget 是 OpenTargetButton 的第三个调用方，
+#      只有它没转发 reveal（FileRouteAction 有、OpenTargetButton 自带判据）。于是
+#      props.reveal 恒 undefined，判据 `props.reveal !== false` 永远成立，文档预览
+#      顶栏的文件夹按钮照旧渲染 —— 点一次错一次。OpenPathEmptyAction 是
+#      jsx(FileOpenTarget, {...props, empty: true})，修好 a 就自动跟上。
+#   b) 调用方（sidebar-documentpreview 的 TextPreview）拿不到 host 对象：它 inject 的
+#      是 slots/locale/sidebarRightTabs/remote/remote.workspaceFiles/configForms/resources，
+#      没有 host，也没有 workspaceDesktop 这个 Remote（只有 canOpenWorkspacePath 一个
+#      布尔）。所以判据放在渲染方：open-in-app 自己读一次的 present.host（P29/P34 用的
+#      同一个路由、同一个 fileManager 字段），不在客户端新造探测；显式传 reveal 的调用方
+#      仍然优先。
+#   c) Android 上「打开」= 本 App 的系统分享面板：present.open -> openWorkspacePath ->
+#      openNativePathWithIntent 的 android 分支 -> usr/bin/dsh-open -> /device/open。
+#      这条链本身是通的（容器内实测 POST /api/present.open 四个坐标全 204），但任何一步
+#      失败都被压成同一个 500 +「打开失败，请重试」——连 dsh-open 的退出码都丢了。
+#      P35c 只做一件桌面端看不见的事：Android 分支的失败带上失败步骤，宿主回 502 说明
+#      停在哪一步，客户端照实说。桌面上 open/reveal 的命令、路径、顺序一个字没动。
+#
+# 顺带查明、本轮不修的：openNativeFileApplication 的 android 分支会走 `open -a`（macOS
+# 的命令），但 Android 上 applications 列表恒为空（queryFileApplications 对 android 返回
+# []），这条分支今天不可达，故只记在这里，不扩大改动面。
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
+				kind: "file",
+				applications: apps,
+""",
+    """			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
+				kind: "file",
+				/* P35a: forward the reveal decision. FileOpenTarget is the third caller of
+				 * OpenTargetButton and the only one that dropped it, so props.reveal stayed undefined
+				 * here and the guard in OpenTargetButton (`props.reveal !== false`) never fired --
+				 * which is why the document-preview header kept its folder button on Android. */
+				reveal: props.reveal !== false,
+				applications: apps,
+""",
+    'P35a: forward the reveal decision',
+    "P35a 文档预览的 FileOpenTarget 把 reveal 转给 OpenTargetButton",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """		/** Page-lifetime desktop availability and the open/reveal carrier shared by every path control. */
+""",
+    """		/* P35b: the Host's destination metadata, browser-relative. This is the same route --
+		 * and the same `fileManager` field -- P29/P34 read for delivery cards; the document
+		 * preview receives no Host object (its plugin injects no host/desktop service and the
+		 * Session Remote exposes canOpenWorkspacePath, a boolean, not the destination), so the
+		 * renderer asks the Host instead of inventing a probe. The value is the same
+		 * browser-relative form deliverables derives with PRESENT_HOST_PATH.slice(1) -- drop the
+		 * "api/" prefix and the read 404s, which silently restores the old behaviour. */
+		const PRESENT_HOST_ROUTE = "api/present.host";
+		/** Page-lifetime desktop availability and the open/reveal carrier shared by every path control. */
+""",
+    "P35b: the Host's destination metadata",
+    "P35b 预览页的判据来源：宿主自己的 present.host（不在客户端新造探测）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			/** Whether the Host desktop can open paths; null until the Host answered, false also after a failed read. */
+			desktop = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)(null);
+""",
+    """			/** Whether the Host desktop can open paths; null until the Host answered, false also after a failed read. */
+			desktop = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)(null);
+			/* P35b: the Host's file-manager answer ("android" means there is no file manager to
+			 * reveal into). null = not answered yet or the route is not served here. */
+			fileManager = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)(null);
+""",
+    "P35b: the Host's file-manager answer",
+    "P35b 渲染方保存宿主的 fileManager（null = 未答/无此路由）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			async run() {
+				let available = false;
+				try {
+					const result = await this.remote.session.canOpenWorkspacePath();
+					available = result.ok && result.value;
+				} catch {}
+				this.desktop.set(available);
+			}
+""",
+    """			async run() {
+				let available = false;
+				try {
+					const result = await this.remote.session.canOpenWorkspacePath();
+					available = result.ok && result.value;
+				} catch {}
+				this.desktop.set(available);
+				/* P35b: read the destination in the same page-lifetime pass. A missing route
+				 * (deliverables not deployed) leaves it null, and null keeps the old behaviour. */
+				let manager = null;
+				try {
+					const response = await fetch(PRESENT_HOST_ROUTE);
+					if (response.ok) {
+						const destination = await response.json();
+						if (destination !== null && typeof destination === "object" && typeof destination.fileManager === "string") manager = destination.fileManager;
+					}
+				} catch {}
+				this.fileManager.set(manager);
+			}
+""",
+    'P35b: read the destination in the same page-lifetime pass',
+    "P35b 控制器一次读里同时取回 fileManager",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			const pathInjected = () => ({
+				hooks: { openInAppDesktop: paths.desktop },
+""",
+    """			const pathInjected = () => ({
+				/* P35b: the document-preview slots get the same two hooks the card slots get, so the
+				 * reveal decision is made where the button is rendered. */
+				hooks: { openInAppDesktop: paths.desktop, openInAppFileManager: paths.fileManager },
+""",
+    'P35b: the document-preview slots get the same two hooks',
+    "P35b 文档预览插槽多注入一个 fileManager hook",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """		function FileOpenTarget(props) {
+			const desktop = props.useOpenInAppDesktop((value) => value);
+""",
+    """		function FileOpenTarget(props) {
+			const desktop = props.useOpenInAppDesktop((value) => value);
+			const fileManager = props.useOpenInAppFileManager((value) => value);
+""",
+    'const fileManager = props.useOpenInAppFileManager((value) => value);',
+    "P35b FileOpenTarget 读宿主的 fileManager",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """				reveal: props.reveal !== false,
+				applications: apps,
+""",
+    """				/* P35b: an explicit caller still wins (the delivery card passes false on Android);
+				 * otherwise the Host's own answer decides, and only "android" drops reveal. */
+				reveal: props.reveal !== false && fileManager !== "android",
+				applications: apps,
+""",
+    'reveal: props.reveal !== false && fileManager !== "android",',
+    "P35b 预览页按宿主判据决定 reveal（android 时不渲染）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			async openPath(path, action, application) {
+				const request = action === "reveal" ? {
+					path,
+					action
+				} : {
+					path,
+					...application === void 0 ? {} : { application }
+				};
+				let ok = false;
+				try {
+					ok = (await this.remote.session.openWorkspacePath(request)).ok;
+				} catch {}
+				return ok ? null : action === "open" ? "openError" : "revealError";
+			}
+""",
+    """			async openPath(path, action, application) {
+				const request = action === "reveal" ? {
+					path,
+					action
+				} : {
+					path,
+					...application === void 0 ? {} : { application }
+				};
+				let ok = false;
+				try {
+					ok = (await this.remote.session.openWorkspacePath(request)).ok;
+				} catch {}
+				/* P35c: the preview header has no present.open coordinates, so this call is its only
+				 * route to the opener. On Android that opener IS the share handoff (dsh-open ->
+				 * /device/open); a failure is not a missing Host desktop and "try again" is not the
+				 * advice to give. Desktop keeps its own two failure kinds. */
+				const shareFailed = action === "open" && this.fileManager.getSnapshot() === "android";
+				return ok ? null : action === "open" ? shareFailed ? "openShareFailed" : "openError" : "revealError";
+			}
+""",
+    'shareFailed ? "openShareFailed" : "openError"',
+    "P35c 预览页的打开失败同样不再说「请重试」",
+)
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """/** Dispatch one shell-free platform command for the requested open intent. */
+""",
+    """/**
+* Report a failed usr/bin/dsh-open handoff with the step that failed.
+*
+* dsh-open is the Android launcher: it hands the path to /device/open, which starts the
+* system share sheet. Its exit codes are the only place that says *where* the handoff
+* stopped (3 no argument, 4 the path is not visible to the app, 5 no device token,
+* 6 the device bridge refused it, 7 the HTTP call itself failed), and execFile turns
+* them into a numeric `code` with the script's stderr attached. Dropping that here is
+* what made every Android open failure surface as one opaque "open failed".
+* @param intent - "open" or "reveal", the gesture that was attempted.
+* @param path - absolute path handed to the launcher.
+* @param error - the execFile failure.
+* @returns an Error whose message names the step and whose `androidStage` is machine-readable.
+*/
+function androidHandoffFailure(intent, path, error) {
+	const code = error !== null && typeof error === "object" && "code" in error ? error.code : void 0;
+	const stderr = error !== null && typeof error === "object" && "stderr" in error && typeof error.stderr === "string" ? error.stderr.trim() : "";
+	const stage = code === "ENOENT" ? "launcher" : code === 3 ? "args" : code === 4 ? "missing" : code === 5 ? "token" : code === 6 || code === 7 ? "bridge" : typeof code === "number" ? "launcher" : "unknown";
+	const exit = code === void 0 ? "no exit code" : typeof code === "number" ? `exit ${code}` : String(code);
+	const head = stderr.split("\\n")[0];
+	const failure = new Error(`android ${intent}: dsh-open failed (${exit}) for ${path}${head === "" ? "" : `: ${head}`}`, { cause: error });
+	failure.androidStage = stage;
+	return failure;
+}
+/** Dispatch one shell-free platform command for the requested open intent. */
+""",
+    'androidHandoffFailure',
+    "P35c dsh-open 失败带上「哪一步」（退出码 → stage）",
+)
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """	if (platform === "android") {
+		/* dsh-open-open */
+		await run("dsh-open", [path], signal, "hidden");
+		return;
+	}
+""",
+    """	if (platform === "android") {
+		/* dsh-open-open */
+		/* P35c: the launcher is the whole Android handoff -- keep its exit code and its
+		 * stderr instead of collapsing them into the caller's generic failure. */
+		try {
+			await run("dsh-open", [path], signal, "hidden");
+		} catch (error) {
+			signal.throwIfAborted();
+			throw androidHandoffFailure("open", path, error);
+		}
+		return;
+	}
+""",
+    'P35c: the launcher is the whole Android handoff',
+    "P35c Android 打开：保留 dsh-open 的退出码与 stderr",
+)
+patch(
+    "@deepseek-ai/dsh-native-command/lib/index.js",
+    """	if (manager === "android") {
+		/* dsh-open-reveal */
+		await run("dsh-open", [path], signal, "hidden");
+		return;
+	}
+""",
+    """	if (manager === "android") {
+		/* dsh-open-reveal */
+		/* P35c: same handoff, same diagnosis -- reveal is hidden on Android since P34, but
+		 * the branch stays reachable from other surfaces and must not lie either. */
+		try {
+			await run("dsh-open", [path], signal, "hidden");
+		} catch (error) {
+			signal.throwIfAborted();
+			throw androidHandoffFailure("reveal", path, error);
+		}
+		return;
+	}
+""",
+    'P35c: same handoff, same diagnosis',
+    "P35c Android reveal：同一套诊断",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/index.js",
+    """	const application = new URL(request.url).searchParams.get("application");
+	await ctx.sessionController.openWorkspacePath({
+		path,
+		...action === "reveal" ? { action } : application === null ? {} : { application }
+	}, request.signal);
+	return new Response(null, {
+		status: 204,
+		headers: { "cache-control": "no-store" }
+	});
+""",
+    """	const application = new URL(request.url).searchParams.get("application");
+	/* P35c: on Android the opener is usr/bin/dsh-open -> the App's device bridge -> the
+	 * system share sheet. A failure there is not "the Host desktop failed", and it used to
+	 * surface as one opaque 500 (the browser could only say "open failed, try again").
+	 * Answer 502 with the step that failed so the card can name it, and log the detail.
+	 * Desktop behaviour is untouched: every other platform rethrows, and the 500/409/404
+	 * handlings downstream are byte-identical. */
+	try {
+		await ctx.sessionController.openWorkspacePath({
+			path,
+			...action === "reveal" ? { action } : application === null ? {} : { application }
+		}, request.signal);
+	} catch (error) {
+		request.signal.throwIfAborted();
+		if (ctx.sessionController.workspaceDesktop().fileManager !== "android") throw error;
+		const cause = error !== null && typeof error === "object" && "cause" in error ? error.cause : void 0;
+		const stage = cause !== null && typeof cause === "object" && "androidStage" in cause && typeof cause.androidStage === "string" ? cause.androidStage : "unknown";
+		const detail = cause instanceof Error ? cause.message : error instanceof Error ? error.message : String(error);
+		console.warn("open-in-app: android " + action + " handoff failed (" + stage + "): " + detail);
+		return Response.json({
+			step: "android-open",
+			stage,
+			detail
+		}, {
+			status: 502,
+			headers: { "cache-control": "no-store" }
+		});
+	}
+	return new Response(null, {
+		status: 204,
+		headers: { "cache-control": "no-store" }
+	});
+""",
+    'P35c: on Android the opener is usr/bin/dsh-open',
+    "P35c 宿主侧：Android 打开失败回 502 + 失败步骤（桌面端仍走原路）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """					if (!response.ok) phase = response.status === 422 ? "nativeUnavailable" : failure;
+""",
+    """					if (!response.ok) phase = response.status === 422 ? "nativeUnavailable" : failure;
+					/* P35c: 502 carries the Android handoff step (see the Host half). Two outcomes are
+					 * worth telling apart: the path is gone, or the share handoff itself was refused. */
+					if (response.status === 502) {
+						const refusal = await response.json().catch(() => void 0);
+						if (refusal !== void 0 && refusal.step === "android-open") phase = refusal.stage === "missing" ? "androidOpenMissing" : "androidOpenFailed";
+					}
+""",
+    'P35c: 502 carries the Android handoff step',
+    "P35c 客户端：读 502 的失败步骤（missing / 其它）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """				return phase === "opened" || phase === "revealed" ? null : action === "reveal" ? "revealError" : "openError";
+""",
+    """				/* P35c: a failed Android handoff must not come back as "open failed, try again" --
+				 * neither retry nor "Host desktop" describes what happened. */
+				return phase === "opened" || phase === "revealed" ? null : phase === "androidOpenMissing" ? "openMissing" : phase === "androidOpenFailed" ? "openShareFailed" : action === "reveal" ? "revealError" : "openError";
+""",
+    'P35c: a failed Android handoff must not come back',
+    "P35c 客户端：失败回具体的文案键（不再一律 openError）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """			const status = phase === void 0 ? cardDescription(file.description, metadata) : t(reveal === "directory" && phase === "revealed" ? "presented.directoryOpened" : reveal === "directory" && phase === "revealing" ? "presented.directoryOpening" : reveal === "directory" && phase === "revealError" ? "presented.directoryError" : `presented.${phase}`);
+""",
+    """			const status = phase === void 0 ? cardDescription(file.description, metadata) : t(reveal === "directory" && phase === "revealed" ? "presented.directoryOpened" : reveal === "directory" && phase === "revealing" ? "presented.directoryOpening" : reveal === "directory" && phase === "revealError" ? "presented.directoryError" : phase === "androidOpenMissing" ? "presented.androidOpenMissing" : phase === "androidOpenFailed" ? "presented.androidOpenFailed" : `presented.${phase}`);
+""",
+    'phase === "androidOpenMissing" ? "presented.androidOpenMissing"',
+    "P35c 卡片：Android 失败的两种文案（文件不在了 / 分享通道没接住）",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """								"data-error": phase === "error" || phase === "revealError" || phase === "nativeUnavailable" ? true : void 0,
+""",
+    """								"data-error": phase === "error" || phase === "revealError" || phase === "nativeUnavailable" || phase === "androidOpenFailed" || phase === "androidOpenMissing" ? true : void 0,
+""",
+    '"androidOpenFailed" || phase === "androidOpenMissing" ? true',
+    "P35c 卡片：两种 Android 失败都按错误样式显示",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """			"presented.nativeUnavailable": "此文件没有可用的主机路径，请在侧边栏预览",
+""",
+    """			"presented.nativeUnavailable": "此文件没有可用的主机路径，请在侧边栏预览",
+			/* P35c: Android 的打开是「本 App 的分享通道」，失败要说清停在哪一步。 */
+			"presented.androidOpenMissing": "打开失败：文件已不在原路径",
+			"presented.androidOpenFailed": "打开失败：系统分享面板没有接住这个文件",
+""",
+    '"presented.androidOpenFailed": "打开失败：系统分享面板没有接住这个文件"',
+    "P35c 中文文案：Android 打开失败的两种",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+    """			"presented.nativeUnavailable": "This file has no available Host path. Preview it in the sidebar.",
+""",
+    """			"presented.nativeUnavailable": "This file has no available Host path. Preview it in the sidebar.",
+			/* P35c: Android opens through this App's share sheet; name the step that failed. */
+			"presented.androidOpenMissing": "Could not open: the file is no longer at that path",
+			"presented.androidOpenFailed": "Could not open: the share sheet did not accept this file",
+""",
+    '"presented.androidOpenFailed": "Could not open: the share sheet did not accept this file"',
+    "P35c 英文文案：Android 打开失败的两种",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			"path.openError": "打开失败，请重试",
+""",
+    """			"path.openError": "打开失败，请重试",
+			/* P35c: Android handoff failures -- "try again" is wrong advice for both. */
+			"path.openMissing": "打开失败：文件已不在原路径",
+			"path.openShareFailed": "打开失败：系统分享面板没有接住这个文件",
+""",
+    '"path.openShareFailed": "打开失败：系统分享面板没有接住这个文件"',
+    "P35c 中文 toast 文案：不再一律「请重试」",
+)
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """			"path.openError": "Could not open. Try again.",
+""",
+    """			"path.openError": "Could not open. Try again.",
+			/* P35c: Android handoff failures -- "try again" is wrong advice for both. */
+			"path.openMissing": "Could not open: the file is no longer at that path",
+			"path.openShareFailed": "Could not open: the share sheet did not accept this file",
+""",
+    '"path.openShareFailed": "Could not open: the share sheet did not accept this file"',
+    "P35c 英文 toast 文案：不再一律 Try again",
+)
+
 # ── 必成清单：没落地就不是"少个功能"，而是产物直接不可用 ────────────────────
 # patch() 的失败默认只是记一行「跳过」，脚本照样退出 0 —— 以前正是这样让坏产物
 # 一路走到打包。这里列出「缺了就废」的条目：只要它不是"已打过"，就以非 0 退出。
@@ -2800,6 +3206,25 @@ MUST_APPLY = {
     "P34e review 面板把同一判据传给同一个插槽（android 时 reveal:false）":
         "review 面板那处拿不到标记 → 主按钮仍写着「显示文件位置」，"
         "点下去还是同一个错，第 7 条只修了卡片那一半",
+    # P35：Issue #4 第二轮。a/b 是同一个按钮的第四处漏（预览页），c 是 Android 上
+    # 「打开」失败时唯一能说明白的一句话——缺了它，失败又变回「打开失败，请重试」。
+    "P35a 文档预览的 FileOpenTarget 把 reveal 转给 OpenTargetButton":
+        "预览页的 props.reveal 恒 undefined → 文件夹图标照旧渲染，"
+        "点一次 toast 一次「无法显示文件位置」，第 ③ 条等于没修",
+    "P35b 预览页按宿主判据决定 reveal（android 时不渲染）":
+        "判据接不上渲染方 → P35a 转发的是 undefined → 仍然「永远显示」",
+    "P35b 控制器一次读里同时取回 fileManager":
+        "没有 fileManager → 渲染方无从判断 Android，预览页的 reveal 照旧渲染",
+    "P35c dsh-open 失败带上「哪一步」（退出码 → stage）":
+        "退出码被 execFile 丢掉 → 宿主只能说「path open failed」，"
+        "客户端只能回「打开失败，请重试」，用户与排查的人都看不出停在哪一步",
+    "P35c 宿主侧：Android 打开失败回 502 + 失败步骤（桌面端仍走原路）":
+        "失败仍是 500 → 客户端分不出「文件不在了」和「分享通道没接住」，"
+        "第 ① 条的要求（能看出是哪一步失败）没落地",
+    "P35c 客户端：读 502 的失败步骤（missing / 其它）":
+        "不读 502 → 新加的两种文案永远显示不出来，等于白改",
+    "P35c 中文 toast 文案：不再一律「请重试」":
+        "toast 仍回「打开失败，请重试」→ 那句误导文案还在",
 }
 # 光记账不够：note 误命中（本脚本栽过三次）会让条目报「已打过」而其实没改。
 # 所以必成条目还要对着落盘结果验一遍。
@@ -2973,6 +3398,51 @@ MUST_STATE = [
         "available: native,\n\t\t\t\t\t\t\t\t\t\t/* P34e: android hides reveal",
         "review 面板那处也必须把 fileManager 判据传给插槽（P34e）",
         "不传的话 review 面板的主按钮仍是「显示文件位置」，点一次错一次",
+    ),
+    # P35 落盘形态：预览页那一处必须转发并合成判据，且判据必须来自宿主自己
+    # 的 present.host（不是新造探测）；Android 打开失败必须带上 stage 并回 502。
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        "const PRESENT_HOST_ROUTE = \"api/present.host\";",
+        "预览页必须能读到宿主的 fileManager（P35b）",
+        "没有它，预览页只能靠 canOpenWorkspacePath 那个布尔，"
+        "分不出「有桌面」还是「有分享面板」",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        "reveal: props.reveal !== false && fileManager !== \"android\",",
+        "预览页的 reveal 必须按宿主判据决定（P35a + P35b）",
+        "只转发不判据，Android 上照旧画那个必然失败的文件夹按钮",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        "\"path.openShareFailed\"",
+        "Android 打开失败必须有独立文案（P35c）",
+        "没有它，toast 还是「打开失败，请重试」——重试永远没用",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-deliverables/lib/index.js",
+        "\"android-open\",",
+        "宿主侧必须把 Android 的失败步骤回给客户端（P35c）",
+        "仍回 500 的话，客户端只能给出那句误导人的通用文案",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
+        "phase === \"androidOpenFailed\" ? \"openShareFailed\"",
+        "卡片必须把失败步骤映射成具体文案键（P35c）",
+        "映射不在，新文案显示不出来，toast 又回到 openError",
+    ),
+    (
+        "@deepseek-ai/dsh-native-command/lib/index.js",
+        "throw androidHandoffFailure(\"open\", path, error);",
+        "Android 打开必须保留 dsh-open 的退出码（P35c）",
+        "丢了退出码，「哪一步失败」就只剩猜测",
+    ),
+    (
+        "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+        'shareFailed ? "openShareFailed" : "openError"',
+        "预览页的打开失败也必须给出具体文案（P35c）",
+        "不改的话预览页仍是「打开失败，请重试」——同一句话在两个界面上说法不一致",
     ),
 ]
 
