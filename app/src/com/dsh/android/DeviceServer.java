@@ -89,6 +89,7 @@ final class DeviceServer {
                         DiagnosticServer.appendLog(filesDir,
                                 "device bridge: http://127.0.0.1:" + candidate + "/" + " | "
                                         + DeviceShell.line());
+                        writePortFile(candidate);
                         serve(server);
                         return;
                     } catch (Throwable inUse) {
@@ -102,10 +103,72 @@ final class DeviceServer {
                 }
                 Log.w(TAG, "device bridge could not bind any port");
                 DiagnosticServer.appendLog(filesDir, "device bridge: could not bind any port");
+                clearPortFile();
             }
         }, "dsh-device");
         thread.setDaemon(true);
         thread.start();
+    }
+
+    /**
+     * The harness home, `<files>/home/.dsh` -- the `DSH_HOME` NodeServer hands to
+     * every child (see applyRuntimeEnv: `new File(home, ".dsh")` with
+     * home = new File(getFilesDir(), "home")). Same source, not a guess: the
+     * file only helps if `dsh-open` finds it at exactly `$DSH_HOME/device.port`.
+     */
+    private File harnessDshHome() {
+        return new File(new File(filesDir, "home"), ".dsh");
+    }
+
+    /**
+     * Publish the port the bridge actually bound on, so the shipped
+     * `dsh-open` reads it instead of probing 3090-3096 on every call.
+     * Best effort by design: a read-only or missing home must never keep the
+     * bridge from serving.
+     */
+    private void writePortFile(int boundPort) {
+        File dir = harnessDshHome();
+        File file = new File(dir, "device.port");
+        try {
+            if (!dir.mkdirs() && !dir.isDirectory()) {
+                throw new java.io.IOException("cannot create " + dir.getAbsolutePath());
+            }
+            java.io.FileOutputStream out = new java.io.FileOutputStream(file);
+            try {
+                out.write(Integer.toString(boundPort).getBytes("UTF-8"));
+            } finally {
+                out.close();
+            }
+            // The home next to it holds the device token; keep the port 0600 too.
+            file.setReadable(false, false);
+            file.setReadable(true, true);
+            file.setWritable(false, false);
+            file.setWritable(true, true);
+            Process chmod = new ProcessBuilder("/system/bin/chmod", "600",
+                    file.getAbsolutePath()).redirectErrorStream(true).start();
+            chmod.waitFor();
+        } catch (Throwable t) {
+            Log.w(TAG, "could not write device.port: " + t);
+            DiagnosticServer.appendLog(filesDir,
+                    "device bridge: could not write device.port: " + t);
+        }
+    }
+
+    /**
+     * A leftover port file is worse than none: `dsh-open` trusts the file and
+     * skips probing, so a dead port would fail every open until the next boot.
+     */
+    private void clearPortFile() {
+        File file = new File(harnessDshHome(), "device.port");
+        try {
+            if (file.exists() && !file.delete()) {
+                Log.w(TAG, "could not delete stale device.port");
+                DiagnosticServer.appendLog(filesDir,
+                        "device bridge: could not delete stale device.port");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "could not delete stale device.port: " + t);
+        }
     }
 
     private void serve(ServerSocket server) {
