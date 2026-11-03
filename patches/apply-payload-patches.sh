@@ -3200,11 +3200,163 @@ patch(
     "P36 变更卡片：同一处理（changes）",
 )
 
+patch(
+    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    """		lastStepBoundary: null,
+		lastTurn: 0
+	}),
+""",
+    """		lastStepBoundary: null,
+		lastTurn: 0,
+		lastStep: 0
+	}),
+""",
+    "P37",
+    "P37 区域 3：P37",
+)
+patch(
+    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    """				signal.throwIfAborted();
+				const step = phase.step + 1;
+				const decision = await this.preStep(target, {
+""",
+    """				signal.throwIfAborted();
+				/* P37a: a resumed or re-entered loop can carry a stale phase.step; the
+				 * session projection still knows the last step this turn actually wrote. */
+				const boundary = this.loopCtx.sessionProjections.stateOf(this.session, "turnBoundary");
+				const step = Math.max(phase.step, boundary?.lastStep ?? 0) + 1;
+				const decision = await this.preStep(target, {
+""",
+    "P37a: a resumed or re-entered loop can carry a stale phase.step; the",
+    "P37 区域 1：P37a: a resumed or re-entered loop c",
+)
+patch(
+    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    """		}).nullable(),
+		lastTurn: z$1.number().int().nonnegative()
+	}),
+""",
+    """		}).nullable(),
+		lastTurn: z$1.number().int().nonnegative(),
+		/* P37a: the last step number written in the open turn, so a stale loop phase cannot reuse it. */
+		lastStep: z$1.number().int().nonnegative().default(0)
+	}),
+""",
+    "P37a: the last step number written in the open turn, so a stale loop phase cannot reuse it",
+    "P37 区域 2：P37a: the last step number written i",
+)
+patch(
+    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    """				openTurnStartSeq: event.seq,
+				lastTurn: event.data.turn
+			};
+""",
+    """				openTurnStartSeq: event.seq,
+				lastTurn: event.data.turn,
+				/* P37a: a new turn restarts at step 0. */
+				lastStep: 0
+			};
+""",
+    "P37a: a new turn restarts at step 0.",
+    "P37 区域 4：P37a: a new turn restarts at step 0.",
+)
+patch(
+    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    """				lastStepStartSeq: event.seq,
+				lastStepBoundary: {
+""",
+    """				lastStepStartSeq: event.seq,
+				/* P37a: remember the step this turn actually wrote. */
+				lastStep: event.data.step,
+				lastStepBoundary: {
+""",
+    "P37a: remember the step this turn actually wrote.",
+    "P37 区域 5：P37a: remember the step this turn ac",
+)
+patch(
+    "@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js",
+    """*/
+function assertReleasedV4Relationships(artifact, knownEventTypes) {
+	const ids = /* @__PURE__ */ new Set();
+""",
+    """*/
+/**
+ * P37: repair a duplicated step sequence before the relationship walk rejects
+ * the whole session. A resumed/retried turn can append `step/start` for a step
+ * that already ended; every byte and every other relationship is valid, so
+ * renumber just the affected step range in place and let the history load.
+ * @param artifact - decoded artifact whose events are renumbered in place.
+ */
+function repairV4StepSequence(artifact) {
+	const events = artifact.events;
+	let turn = null;
+	let nextStep = 1;
+	let openStep = null;
+	let remap = null;
+	for (const event of events) {
+		const data = event.data;
+		if (data === null || typeof data !== "object") continue;
+		switch (event.type) {
+			case "turn/start":
+				turn = data["turn"];
+				nextStep = 1;
+				openStep = null;
+				remap = null;
+				break;
+			case "turn/end":
+				turn = null;
+				openStep = null;
+				remap = null;
+				break;
+			case "step/start": {
+				if (turn === null || data["turn"] !== turn || openStep !== null) break;
+				if (data["step"] !== nextStep) {
+					console.warn(`[session] repaired step/start ${turn}/${data["step"]} -> ${nextStep}`);
+					remap = { from: data["step"], to: nextStep };
+					data["step"] = nextStep;
+				}
+				openStep = nextStep;
+				break;
+			}
+			case "step/end":
+				if (remap !== null && data["turn"] === turn && data["step"] === remap.from) data["step"] = remap.to;
+				openStep = null;
+				nextStep += 1;
+				remap = null;
+				break;
+			default:
+				if (remap !== null && data["turn"] === turn && data["step"] === remap.from) data["step"] = remap.to;
+				break;
+		}
+	}
+}
+
+function assertReleasedV4Relationships(artifact, knownEventTypes) {
+	repairV4StepSequence(artifact);
+	const ids = /* @__PURE__ */ new Set();
+""",
+    "* P37: repair a duplicated step sequence before the relationship walk rejects",
+    "P37 区域 6：* P37: repair a duplicated step sequ",
+)
+
+
 # ── 必成清单：没落地就不是"少个功能"，而是产物直接不可用 ────────────────────
 # patch() 的失败默认只是记一行「跳过」，脚本照样退出 0 —— 以前正是这样让坏产物
 # 一路走到打包。这里列出「缺了就废」的条目：只要它不是"已打过"，就以非 0 退出。
 # 「已打过」是合法的（第二遍复验就是这个状态），所以只拦 missing / anchor。
 MUST_APPLY = {
+    "P37 区域 1：P37a: a resumed or re-entered loop c":
+        "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
+    "P37 区域 2：P37a: the last step number written i":
+        "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
+    "P37 区域 3：P37":
+        "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
+    "P37 区域 4：P37a: a new turn restarts at step 0.":
+        "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
+    "P37 区域 5：P37a: remember the step this turn ac":
+        "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
+    "P37 区域 6：* P37: repair a duplicated step sequ":
+        "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
     "P36 打开前的 stat 在 Android 上回 502 missing（helper）":
         "helper 不在 → 卡片打开被删文件仍走 404，界面只会说「打开失败，点击重试」",
     "P36 交付卡片：文件被删时走 missing（presented）":
