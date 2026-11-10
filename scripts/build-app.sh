@@ -103,7 +103,7 @@ MANIFEST="$WORK/AndroidManifest.xml"
 # once and their classes.jar kept in app/libs; they go into javac's classpath and
 # into the dex. See docs/PITFALLS.md #17 for why the dex step is D8, not dx.
 LIB_JARS=()
-for jar in "$APP"/libs/shizuku-*.jar; do
+for jar in "$APP"/libs/shizuku-*.jar "$APP"/libs/sherpa-onnx-classes.jar "$APP"/libs/kotlin-stdlib.jar; do
     [ -f "$jar" ] && LIB_JARS+=("$jar")
 done
 if [ ${#LIB_JARS[@]} -eq 0 ]; then
@@ -111,6 +111,10 @@ if [ ${#LIB_JARS[@]} -eq 0 ]; then
     echo "13.1.0 AARs and drop their classes.jar into app/libs/ (see docs/PITFALLS.md #17)" >&2
     exit 1
 fi
+for jar in "$APP"/libs/sherpa-onnx-classes.jar "$APP"/libs/kotlin-stdlib.jar; do
+    [ -f "$jar" ] || { echo "missing $jar -- run scripts/fetch-sherpa.sh first" >&2; exit 1; }
+done
+
 CLASSPATH_ALL="$PLATFORM_JAR"
 for jar in "${LIB_JARS[@]}"; do
     CLASSPATH_ALL="$CLASSPATH_ALL:$jar"
@@ -142,6 +146,15 @@ fi
 
 cp "$WORK/base.apk" "$WORK/unsigned.apk"
 ( cd "$WORK/dex" && zip -q -X "$WORK/unsigned.apk" classes.dex )
+
+# Native JNI libraries: stored (-0), not deflated, so zipalign -p can page-align
+# them. arm64-v8a only; the sources come from scripts/fetch-sherpa.sh.
+if [ -d "$APP/jni/lib" ]; then
+    ( cd "$APP/jni" && zip -q -X -0 -r "$WORK/unsigned.apk" lib )
+else
+    echo "no app/jni/lib -- run scripts/fetch-sherpa.sh first" >&2
+    exit 1
+fi
 
 if [ ! -f "$KEYSTORE" ]; then
   keytool -genkeypair -keystore "$KEYSTORE" -storepass "$KS_PASS" -keypass "$KS_PASS" \
