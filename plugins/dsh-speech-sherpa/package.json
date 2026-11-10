@@ -1,6 +1,6 @@
 {
   "name": "dsh-speech-sherpa",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Android 本机语音识别：把 16k WAV 交给 App 的 /device/asr（sherpa-onnx + SenseVoiceSmall int8），不联网、不产生调用费。",

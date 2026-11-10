@@ -13,6 +13,7 @@
     <!-- getUserMedia() in the WebView: without the runtime permission the
          capture request is denied before any prompt can appear. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14+ requires a declared type plus its matching permission for
          foreground services; the node process is kept alive as a data-sync job. -->

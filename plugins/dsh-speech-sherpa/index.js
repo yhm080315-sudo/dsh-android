@@ -184,7 +184,16 @@ function createTranscribe(env, config) {
 			signal,
 		});
 		const text = res.body.toString('utf8').trim();
-		if (res.status === 200) return text;
+		if (res.status === 200) {
+			// 远程协议要求 {text, audioSeconds, inferenceSeconds}；桥的头里都有。
+			const ms = Number(res.headers['x-asr-ms'] ?? 0);
+			const audioMs = Number(res.headers['x-asr-audio-ms'] ?? 0);
+			return {
+				text,
+				audioSeconds: Number.isFinite(audioMs) ? audioMs / 1000 : 0,
+				inferenceSeconds: Number.isFinite(ms) ? ms / 1000 : 0,
+			};
+		}
 		if (res.status === 503) {
 			// 引擎/模型没准备好：把 App 的原话带上去，UI 会提示去"准备"。
 			throw new Error(`ASR_NOT_READY: ${text}`);
