@@ -348,6 +348,99 @@ public class NodeServer extends Service {
         }
     }
 
+    /**
+     * 装 APK 自带的插件包（assets/plugins/*.tgz）。
+     *
+     * 为什么不塞进载荷：载荷 207MB，重打一次要解 600MB 再压回；而且 RUNTIME_STAMP
+     * 一变，真机升级就要重新解包 600MB（几分钟＋失败风险）。插件只有几十 KB，走
+     * profile（用户状态）就能"升级自带、热替换方便"，同时载荷字节保持不变。
+     *
+     * 幂等：目标已存在且 package.json 的 version 相同就跳过；不同则先删再装
+     * —— 自带插件跟着 APK 走，用户不该在设置页看到一个过期版本。
+     */
+    private void installAssetsPlugins(File web) {
+        File modules = new File(web, "node_modules");
+        String[] entries;
+        try {
+            entries = getAssets().list("plugins");
+        } catch (Throwable t) {
+            return;
+        }
+        if (entries == null || entries.length == 0) {
+            return;
+        }
+        java.util.Arrays.sort(entries);
+        for (String entry : entries) {
+            if (!entry.endsWith(".tgz")) {
+                continue;
+            }
+            File staging = new File(getCacheDir(), "asset-plugin-" + System.currentTimeMillis());
+            try {
+                InputStream raw = getAssets().open("plugins/" + entry);
+                TarExtractor.Counting in = new TarExtractor.Counting(new GZIPInputStream(raw, 1 << 16));
+                final int[] count = {0};
+                TarExtractor.extract(in, staging, new TarExtractor.Progress() {
+                    @Override
+                    public void onEntry(String name) {
+                        count[0]++;
+                    }
+                });
+                in.close();
+                // npm 的包形状是顶层 package/ 目录；自己打的包可能没有。
+                File root = new File(staging, "package");
+                if (!root.isDirectory()) {
+                    root = staging;
+                }
+                File manifest = new File(root, "package.json");
+                String name = readPackageName(manifest);
+                String version = readPackageVersion(manifest);
+                if (name == null) {
+                    logLine("bundled plugin " + entry + ": no package name, skipped");
+                    continue;
+                }
+                File target = new File(modules, name);
+                if (target.isDirectory()) {
+                    String installed = readPackageVersion(new File(target, "package.json"));
+                    if (version != null && version.equals(installed)) {
+                        logLine("bundled plugin " + name + " " + version + " already installed");
+                        continue;
+                    }
+                    logLine("bundled plugin " + name + ": updating " + installed + " -> " + version);
+                    deleteRecursive(target);
+                }
+                Process p = new ProcessBuilder("/system/bin/cp", "-a",
+                        root.getAbsolutePath(), target.getAbsolutePath())
+                        .redirectErrorStream(true).start();
+                int rc = waitForExit(p, 120000);
+                logLine("bundled plugin " + name + " (" + version + ") installed from assets/plugins/"
+                        + entry + " (" + count[0] + " entries, rc=" + rc + ")");
+            } catch (Throwable t) {
+                logLine("bundled plugin " + entry + " failed: " + t);
+            } finally {
+                deleteRecursive(staging);
+            }
+        }
+    }
+
+    /** The "version" field of a package.json, or null when it cannot be read. */
+    private String readPackageVersion(File manifest) {
+        try {
+            if (!manifest.isFile()) {
+                return null;
+            }
+            byte[] buf = new byte[(int) Math.min(manifest.length(), 1 << 16)];
+            java.io.FileInputStream in = new java.io.FileInputStream(manifest);
+            int n = in.read(buf);
+            in.close();
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"version\"\\s*:\\s*\"([^\"]+)\"")
+                    .matcher(new String(buf, 0, Math.max(0, n), "UTF-8"));
+            return m.find() ? m.group(1) : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /** The "name" field of a package.json, or null when it cannot be read. */
     private String readPackageName(File manifest) {
         try {
@@ -666,9 +759,15 @@ public class NodeServer extends Service {
                     + modules.listFiles().length + " entries total");
         }
 
+        // 自带插件先落盘：ensurePluginRows 只给"能从 profile 解析到"的包写 loader 行。
+        installAssetsPlugins(web);
+
         installSideLoadedPlugins(web);
 
         ensurePluginRows(web);
+
+        // speechToText 的 defaultProvider 指向本机 provider，并关掉 Android 上必挂的 sensevoice。
+        ensureSpeechRows(web);
 
         /*
          * The credentials provider refuses to start unless its store is owner-only.
@@ -730,6 +829,13 @@ public class NodeServer extends Service {
      */
     private static final String[][] BUNDLED_ROWS = {
             {"screen-operate", "dsh-screen-operate"},
+            /*
+             * 本机语音 provider。官方 speech-to-text-sensevoice 走 sherpa-onnx-node，
+             * 只有 glibc 的 linux-arm64 预编译，Android 上必然抛
+             * "Local speech is unavailable for android-arm64"；识别改由 App 自带的
+             * sherpa-onnx arm64-v8a JNI（POST /device/asr）承担，这个插件只是桥。
+             */
+            {"speech-sherpa", "dsh-speech-sherpa"},
     };
 
     private static final String[][] CLIENT_ROWS = {
@@ -861,6 +967,63 @@ public class NodeServer extends Service {
             logLine("profile patch: plugin rows written (" + rows.length() + " bytes)");
         } catch (Throwable t) {
             logLine("plugin rows failed: " + t);
+        }
+    }
+
+    /**
+     * 让 profile 指向本机语音 provider。
+     *
+     * 三件事，全部幂等（只在缺的时候追加）：
+     * <ol>
+     *   <li>关掉官方的 {@code speech-to-text-sensevoice} —— 它在 Android 上
+     *       resolveRuntime() 必抛，留着只会让设置页多一个点了就报错的选项；</li>
+     *   <li>把 {@code speech-to-text} 服务的 defaultProvider 换成 sherpa-android
+     *       （官方 bundle 里写死的是 sensevoice-local）；</li>
+     *   <li>插件行本身由 BUNDLED_ROWS / ensurePluginRows 负责，这里不重复写。</li>
+     * </ol>
+     *
+     * 写入用追加模式：ensurePluginRows 刚把 insert 行写完，这里只补 override，
+     * 重写整份文件会让它和前一步的写入互相覆盖。
+     */
+    private void ensureSpeechRows(File web) {
+        File modules = new File(web, "node_modules");
+        File patch = new File(web, "cordis.patch.yml");
+        /*
+         * 插件解析不到就不要写 override：把 defaultProvider 指到一个不存在的
+         * provider，语音按钮会从"准备失败"变成"识别服务不可用"，反而更难查。
+         */
+        if (!new File(modules, "dsh-speech-sherpa").isDirectory()) {
+            return;
+        }
+        try {
+            String existing = "";
+            if (patch.isFile()) {
+                byte[] buf = new byte[(int) Math.min(patch.length(), 1 << 20)];
+                java.io.FileInputStream in = new java.io.FileInputStream(patch);
+                int n = in.read(buf);
+                in.close();
+                existing = new String(buf, 0, Math.max(0, n), "UTF-8");
+            }
+            StringBuilder add = new StringBuilder();
+            if (!existing.contains("id: speech-to-text-sensevoice")) {
+                add.append("# Android: 官方 SenseVoice provider 没有 bionic 的预编译，关掉\n");
+                add.append("- id: speech-to-text-sensevoice\n  disabled: true\n");
+            }
+            if (!existing.contains("defaultProvider: sherpa-android")) {
+                add.append("# Android: 识别走 App 自带的 sherpa-onnx（/device/asr）\n");
+                add.append("- id: speech-to-text\n  config:\n    defaultProvider: sherpa-android\n");
+            }
+            if (add.length() == 0) {
+                logLine("profile patch: speech rows present");
+                return;
+            }
+            String prefix = existing.isEmpty() || existing.endsWith("\n") ? "" : "\n";
+            java.io.FileOutputStream out = new java.io.FileOutputStream(patch, true);
+            out.write((prefix + add).getBytes("UTF-8"));
+            out.close();
+            logLine("profile patch: speech rows written (" + add.length() + " bytes)");
+        } catch (Throwable t) {
+            logLine("speech rows failed: " + t);
         }
     }
 

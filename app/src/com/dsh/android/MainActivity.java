@@ -72,6 +72,9 @@ public class MainActivity extends Activity implements NodeServer.Listener {
     /** Set while the system picker is open for a page's file input. */
     private android.webkit.ValueCallback<Uri[]> pendingFileCallback;
     private static final int REQUEST_FILE_CHOOSER = 4001;
+    /** Set while a page is waiting for the microphone permission result. */
+    private android.webkit.PermissionRequest pendingAudioRequest;
+    private static final int REQUEST_AUDIO_PERMISSION = 4003;
     /** Picking an image to use as the launcher console background. */
     private static final int REQUEST_BACKGROUND = 4002;
     /** When the WebView attached, to timestamp resource failures against it. */
@@ -1640,6 +1643,38 @@ public class MainActivity extends Activity implements NodeServer.Listener {
                 return true;
             }
 
+            /**
+             * getUserMedia(): a WebView denies every capture request unless the host
+             * answers here, and it does so before the runtime permission is ever
+             * consulted. Ask for RECORD_AUDIO once, then grant exactly the audio
+             * resource the page requested (camera stays denied).
+             */
+            @Override
+            public void onPermissionRequest(final android.webkit.PermissionRequest request) {
+                boolean audio = false;
+                for (String resource : request.getResources()) {
+                    if (android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(resource)) {
+                        audio = true;
+                        break;
+                    }
+                }
+                if (!audio) {
+                    request.deny();
+                    return;
+                }
+                if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    request.grant(new String[]{android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+                    return;
+                }
+                if (pendingAudioRequest != null) {
+                    pendingAudioRequest.deny();
+                }
+                pendingAudioRequest = request;
+                requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO},
+                        REQUEST_AUDIO_PERMISSION);
+            }
+
             @Override
             public boolean onShowFileChooser(WebView view,
                     android.webkit.ValueCallback<Uri[]> callback,
@@ -1909,6 +1944,30 @@ public class MainActivity extends Activity implements NodeServer.Listener {
             return;
         }
         super.onActivityResult(request, result, data);
+    }
+
+    /**
+     * Answer the WebView's pending getUserMedia() request with the runtime
+     * permission result. Other request codes keep the default handling.
+     */
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == REQUEST_AUDIO_PERMISSION) {
+            android.webkit.PermissionRequest pending = pendingAudioRequest;
+            pendingAudioRequest = null;
+            if (pending != null) {
+                boolean granted = grantResults.length > 0
+                        && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+                if (granted) {
+                    pending.grant(new String[]{android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+                } else {
+                    pending.deny();
+                    logLine("microphone: permission denied");
+                }
+                return;
+            }
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
     }
 
     /**

@@ -1,0 +1,23 @@
+{
+  "name": "dsh-speech-sherpa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Android 本机语音识别：把 16k WAV 交给 App 的 /device/asr（sherpa-onnx + SenseVoiceSmall int8），不联网、不产生调用费。",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "meta": {
+    "title": "语音识别 (本机 sherpa-onnx)",
+    "description": "音频不出设备；模型首次使用时下载到 App 私有目录，之后完全离线推理。"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-experimental-speech-to-text": "0.2.1-rc.2"
+  }
+}

@@ -200,6 +200,13 @@ final class DeviceServer {
         String path = "/";
         final Map<String, String> query = new HashMap<String, String>();
         final Map<String, String> headers = new HashMap<String, String>();
+        /**
+         * 请求体，null 表示没有。
+         *
+         * 以前这里不存 body：所有端点都是 GET，读掉 contentLength 个字节就当排空。
+         * /device/asr 是 POST WAV，所以 body 必须留下来（见 handle 的说明）。
+         */
+        byte[] body;
 
         String header(String name) {
             return headers.get(name.toLowerCase(java.util.Locale.US));
@@ -244,13 +251,35 @@ final class DeviceServer {
                 }
             }
         }
-        for (int i = 0; i < contentLength; i++) {
-            if (in.read() < 0) {
-                break;
-            }
-        }
         if (!authorized(req, socket)) {
+            // 未授权时不读 body：一个 8MB 的请求体足以把单线程的 accept 循环拖住。
             return;
+        }
+        /*
+         * 读请求体。旧实现把 contentLength 个字节读完就丢，因为真正被用到的端点
+         * 全是 GET；/device/asr 收的是 POST 上来的 WAV，所以留一份。
+         * 上限 MAX_BODY：语音输入一次最长 120 秒 16k 单声道 PCM16 也只有 3.8MB。
+         */
+        if (contentLength > 0) {
+            if (contentLength > MAX_BODY) {
+                send(socket, 413, "text/plain; charset=utf-8",
+                        ("body too large: " + contentLength + " > " + MAX_BODY + "\n")
+                                .getBytes("UTF-8"));
+                return;
+            }
+            byte[] body = new byte[contentLength];
+            int filled = 0;
+            while (filled < contentLength) {
+                int n = in.read(body, filled, contentLength - filled);
+                if (n < 0) {
+                    break;
+                }
+                filled += n;
+            }
+            if (filled < contentLength) {
+                body = java.util.Arrays.copyOf(body, filled);
+            }
+            req.body = body;
         }
         dispatch(socket, req);
     }
@@ -433,6 +462,12 @@ final class DeviceServer {
                 shell(socket, req.query);
             } else if (path.equals("/device/ocr")) {
                 ocr(socket, req.query);
+            } else if (path.equals("/device/asr")) {
+                asr(socket, req);
+            } else if (path.equals("/device/asr/status")) {
+                asrStatus(socket);
+            } else if (path.equals("/device/asr/model")) {
+                asrModel(socket, req.query);
             } else if (path.equals("/device/top")) {
                 simple(socket, DeviceShell.exec(
                         "dumpsys activity activities | grep -m1 topResumedActivity", 30000));
@@ -475,6 +510,9 @@ final class DeviceServer {
         sb.append("                                             (raw stdout, X-Exit-Code header)\n");
         sb.append("  GET /device/top                            current foreground activity\n");
         sb.append("  GET /device/ocr[?lang=chi_sim+eng]         OCR the screen (needs OCR runtime)\n");
+        sb.append("  POST /device/asr[?language=auto|zh|en|yue|ja|ko]  local speech-to-text, body = WAV\n");
+        sb.append("  GET /device/asr/status                     ASR engine / model / download state (JSON)\n");
+        sb.append("  GET /device/asr/model?action=download|status|cancel  fetch the on-device model\n");
         sb.append("  GET /device/status                         this text\n");
         send(socket, 200, "text/plain; charset=utf-8", sb.toString().getBytes("UTF-8"));
     }
@@ -534,6 +572,84 @@ final class DeviceServer {
             return;
         }
         send(socket, 200, "text/plain; charset=utf-8", text.getBytes("UTF-8"));
+    }
+
+    // --------------------------------------------------------------------- asr
+
+    /**
+     * 本机语音识别：POST 一段 WAV，回一段文字。
+     *
+     * 为什么由 App 做：官方的 SenseVoice provider 走 sherpa-onnx-node，
+     * 只有 glibc 的 linux-arm64 预编译，Android 上加载不了；App 这边能直接
+     * 用 sherpa-onnx 官方 AAR 的 arm64-v8a JNI，全程不联网。
+     *
+     * 输入：body = canonical PCM16 WAV（前端 encodeWave 的产物），或
+     *      ?path=/abs/file.wav 便于用 curl 直接试。
+     * 输出：text/plain UTF-8 正文 + X-Asr-* 头（语种、推理耗时、音频时长）。
+     */
+    private void asr(Socket socket, Request req) throws Exception {
+        String language = req.query.get("language");
+        if (language != null && !language.matches("[a-z]{2,8}")) {
+            throw new BadRequest("invalid 'language'");
+        }
+        byte[] wav = req.body;
+        if (wav == null || wav.length == 0) {
+            String path = req.query.get("path");
+            if (path == null || path.isEmpty()) {
+                throw new BadRequest("POST a WAV body, or pass ?path=/abs/file.wav");
+            }
+            File file = new File(path);
+            if (!file.isAbsolute() || !file.isFile()) {
+                throw new BadRequest("'path' must be an absolute existing file");
+            }
+            if (file.length() > MAX_BODY) {
+                throw new BadRequest("audio file too large");
+            }
+            wav = readFile(file, MAX_BODY);
+        }
+        if (wav.length < 44) {
+            throw new BadRequest("body must be a WAV file");
+        }
+        SpeechBridge.Result result;
+        try {
+            result = SpeechBridge.get(filesDir).transcribe(wav, language);
+        } catch (SpeechBridge.Unavailable unavailable) {
+            // 503：引擎/模型还没准备好，和"请求本身有错"分开，插件才能提示去下载模型。
+            send(socket, 503, "text/plain; charset=utf-8",
+                    (unavailable.getMessage() + "\n").getBytes("UTF-8"));
+            return;
+        } catch (java.io.IOException broken) {
+            send(socket, 400, "text/plain; charset=utf-8",
+                    ("asr: " + broken.getMessage() + "\n").getBytes("UTF-8"));
+            return;
+        }
+        Map<String, String> headers = new HashMap<String, String>();
+        headers.put("X-Asr-Backend", "sherpa-onnx-sense-voice-int8");
+        headers.put("X-Asr-Lang", result.language == null ? "auto" : result.language);
+        headers.put("X-Asr-Ms", String.valueOf(result.inferenceMs));
+        headers.put("X-Asr-Audio-Ms", String.valueOf(result.durationMs));
+        send(socket, 200, "text/plain; charset=utf-8",
+                (result.text + "\n").getBytes("UTF-8"), headers);
+    }
+
+    /** 引擎、模型文件、下载进度一起给出，插件拿它决定 UI 状态。 */
+    private void asrStatus(Socket socket) throws Exception {
+        send(socket, 200, "application/json",
+                SpeechBridge.get(filesDir).statusJson().getBytes("UTF-8"));
+    }
+
+    /**
+     * 模型下载：{@code ?action=download|status|cancel}。
+     *
+     * 下载在 App 的后台线程里跑，这里只回当前状态；插件轮询 status 拿进度。
+     */
+    private void asrModel(Socket socket, Map<String, String> query) throws Exception {
+        String action = query.get("action");
+        if (action != null && !action.matches("[a-z]{3,12}")) {
+            throw new BadRequest("invalid 'action'");
+        }
+        send(socket, 200, "application/json",
+                SpeechBridge.get(filesDir).modelAction(action).getBytes("UTF-8"));
     }
 
     /**
@@ -903,6 +1019,7 @@ final class DeviceServer {
     private static void send(Socket socket, int code, String type, byte[] body,
                              Map<String, String> headers) throws Exception {
         String reason = code == 200 ? "OK" : code == 400 ? "Bad Request"
+                : code == 413 ? "Payload Too Large"
                 : code == 503 ? "Service Unavailable"
                 : code == 404 ? "Not Found" : code == 501 ? "Not Implemented"
                 : "Internal Server Error";

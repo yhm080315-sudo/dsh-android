@@ -1,0 +1,6 @@
+# dsh-speech-sherpa —— Android 本机语音识别（sherpa-onnx + SenseVoiceSmall）
+# 只是给手工安装/排查用：App 会在启动时把这一行写进 profile 的 cordis.patch.yml。
+- insert:
+    - id: speech-sherpa
+      name: 'dsh-speech-sherpa'
+      config: {}
