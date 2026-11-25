@@ -1,0 +1,29 @@
+{
+  "name": "dsh-attachment-maintenance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "附件库维护：找出没有任何会话引用的内容寻址对象，把 files/<sha>/<name> 的重复拷贝换成指向 file-objects/<sha> 的链接。默认 dry-run。",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "meta": {
+    "title": "附件库维护 (Attachment GC)",
+    "description": "清理孤儿附件、折叠重复的文件别名；默认只看不改，删除前先写清单。"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "check.mjs",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+  }
+}

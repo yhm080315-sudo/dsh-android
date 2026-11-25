@@ -3340,11 +3340,88 @@ function assertReleasedV4Relationships(artifact, knownEventTypes) {
 )
 
 
+
+# ── P38: 文件附件被存了两份 ────────────────────────────────────────────────
+#
+# 现象：attachments/v1/file-objects/<sha>/<sha> 与 attachments/v1/files/<sha>/<name>
+# 是同一份字节的两份拷贝（实测 11 个对象、217.3 MB 重复），删掉 files/ 历史就少一
+# 半，删掉 file-objects/ 读附件直接 ATTACHMENT_NOT_FOUND。
+#
+# 根因不在这段代码的意图——publishImmutableAlias 本来就是先 link(2)，失败才复制。
+# 问题是 Android 的 SELinux 策略不允许 app 私有目录里做硬链接，设备上一路都是
+# EACCES：
+#   avc: denied { link } for comm="libuv-worker" tcontext=u:object_r:app_data_file
+#       tclass=file permissive=0 app=com.dsh.android
+# 于是每次保存文件都走进复制分支，重复字节就落盘了。
+#
+# 修法：link(2) 被拒后先把别名做成指向规范对象的**相对**符号链接（实测可用，
+# 且不占数据），符号链接也被拒时才复制。读侧全部按路径打开，所以读取、摘要、
+# 大小校验、以及「路径以真实文件名结尾」这条约定都不变。
+
+patch(
+    "@deepseek-ai/dsh-attachment-local/lib/index.js",
+    """import { dirname, join, parse, resolve } from "node:path";""",
+    """import { dirname, join, parse, relative, resolve } from "node:path";""",
+    'parse, relative, resolve',
+    'P38a 附件别名：node:path 需要 relative',
+)
+
+patch(
+    "@deepseek-ai/dsh-attachment-local/lib/index.js",
+    """import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";""",
+    """import { chmod, link, mkdir, open, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";""",
+    'rm, symlink, unlink',
+    'P38b 附件别名：node:fs/promises 需要 symlink',
+)
+
+patch(
+    "@deepseek-ai/dsh-attachment-local/lib/index.js",
+    """			} else if (code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+				try {
+					await writeFile(target, await readFile(source), { mode: 384, flag: "wx" });
+				} catch (copyError) {
+""",
+    """			} else if (code === "EACCES" || code === "EPERM" || code === "ENOSYS" || code === "ENOTSUP" || code === "EXDEV") {
+				/* P38: the alias is a symlink to the canonical object, not a second copy.
+				 * Android refuses link(2) inside app-private storage -- SELinux logs
+				 * `avc: denied { link } for comm="libuv-worker" ... tclass=file permissive=0`
+				 * on this device -- so every saved file fell through to the copy below and
+				 * its bytes landed twice: file-objects/<digest> and files/<digest>/<name>.
+				 * A relative symlink costs one inode and no data. Every reader opens the
+				 * alias by path, so streamed reads, digests, size checks and the "path ends
+				 * in the real file name" contract are unchanged; a relative target also
+				 * survives moving and restoring the home directory. The copy stays as the
+				 * last resort for a filesystem that refuses symlink(2) too. */
+				let aliased = false;
+				try {
+					await symlink(relative(dirname(target), source), target);
+					aliased = true;
+				} catch (symlinkError) {
+					const symlinkCode = symlinkError instanceof Error && "code" in symlinkError ? symlinkError.code : void 0;
+					if (symlinkCode === "EEXIST") {
+						if (await digestFile(target) !== sha256) throw new AttachmentError("Stored attachment failed integrity verification.", "ATTACHMENT_CORRUPT");
+						aliased = true;
+					} else if (symlinkCode !== "EACCES" && symlinkCode !== "EPERM" && symlinkCode !== "ENOSYS" && symlinkCode !== "ENOTSUP" && symlinkCode !== "EXDEV") throw symlinkError;
+				}
+				if (!aliased) try {
+					await writeFile(target, await readFile(source), { mode: 384, flag: "wx" });
+				} catch (copyError) {
+""",
+    '/* P38: the alias is a symlink to the canonical object, not a second copy.',
+    'P38c 附件别名：link(2) 被拒后先做符号链接，再回退复制',
+)
+
 # ── 必成清单：没落地就不是"少个功能"，而是产物直接不可用 ────────────────────
 # patch() 的失败默认只是记一行「跳过」，脚本照样退出 0 —— 以前正是这样让坏产物
 # 一路走到打包。这里列出「缺了就废」的条目：只要它不是"已打过"，就以非 0 退出。
 # 「已打过」是合法的（第二遍复验就是这个状态），所以只拦 missing / anchor。
 MUST_APPLY = {
+    "P38a 附件别名：node:path 需要 relative":
+        "P38 没落地：写侧仍会为每个文件附件落第二份拷贝（Android 上 link(2) 被 SELinux 拒绝）",
+    "P38b 附件别名：node:fs/promises 需要 symlink":
+        "P38 没落地：写侧仍会为每个文件附件落第二份拷贝（Android 上 link(2) 被 SELinux 拒绝）",
+    "P38c 附件别名：link(2) 被拒后先做符号链接，再回退复制":
+        "P38 没落地：写侧仍会为每个文件附件落第二份拷贝（Android 上 link(2) 被 SELinux 拒绝）",
     "P37 区域 1：P37a: a resumed or re-entered loop c":
         "P37 没落地：重复 step 的日志仍会被整份拒绝，写侧也仍可能再次写坏",
     "P37 区域 2：P37a: the last step number written i":

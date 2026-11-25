@@ -836,6 +836,13 @@ public class NodeServer extends Service {
              * sherpa-onnx arm64-v8a JNI（POST /device/asr）承担，这个插件只是桥。
              */
             {"speech-sherpa", "dsh-speech-sherpa"},
+            /*
+             * 附件库维护。附件是内容寻址的，会话日志里只存 sha256 引用；1.0.25 的 P38 让写侧
+             * 用相对符号链接代替重复拷贝（Android 的 SELinux 禁 app 私有目录里的 link(2)），
+             * 这个插件负责把历史遗留的重复也折叠成链接，并回收没有任何会话引用的对象。
+             * 默认 dry-run，删除前先写 ~/.dsh/attachments/gc-<时间>.json。
+             */
+            {"attachment-maintenance", "dsh-attachment-maintenance"},
     };
 
     private static final String[][] CLIENT_ROWS = {

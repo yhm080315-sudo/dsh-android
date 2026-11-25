@@ -1,0 +1,6 @@
+# dsh-attachment-maintenance —— 附件库维护（孤儿回收 + 重复别名折叠）
+# 只是给手工安装/排查用：App 会在启动时把这一行写进 profile 的 cordis.patch.yml。
+- insert:
+    - id: attachment-maintenance
+      name: 'dsh-attachment-maintenance'
+      config: {}
