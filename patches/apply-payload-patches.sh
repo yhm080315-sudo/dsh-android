@@ -617,28 +617,14 @@ patch(
     "P4  目录 fsync 容忍权限错误",
 )
 
-# ── P9: 裸包名必须按 profile 解析 ───────────────────────────────────────────
-patch(
-    "@deepseek-ai/cordis-plugin-loader/lib/index.js",
-    """			else return await import(__rewriteRelativeImportExtension(
-				/* @vite-ignore */
-				name
-			));""",
-    """			else {
-				/*
-				 * Android: without Node's internal loader, `import(name)` resolves a
-				 * bare specifier against THIS file -- the harness installation -- so a
-				 * plugin installed into the profile is not found.
-				 */
-				const resolved = resolveSpecifierFromBase(name, this.ctx.baseUrl);
-				return await import(__rewriteRelativeImportExtension(
-					/* @vite-ignore */
-					resolved
-				));
-			}""",
-    "resolveSpecifierFromBase",
-    "P9  裸包名按 profile 解析",
-)
+# ── P9（0.2.2 起作废）：裸包名按 profile 解析 ──────────────────────────────
+# 0.2.1 时 cordis-plugin-loader 对裸 specifier 直接 `import(name)`，会相对本文件
+# （= harness 安装目录）解析，于是装进 profile 的插件找不到。当时用 P9 换成
+# `resolveSpecifierFromBase(name, this.ctx.baseUrl)` —— 但那个函数全仓库从未定义，
+# 一旦真走到裸包名分支就是 ReferenceError（1.0.25 里的潜在缺陷）。
+# 0.2.2 上游改成 `createResolve(this.ctx.baseUrl)`（写 .cordis/resolve.mjs，用
+# createRequire 锚在配置文件的 package scope 上），语义正是 P9 想要的那个，
+# 所以整条补丁删除。见 HANDOVER §17。
 
 # ── P11: 文件工具的「新建」在本平台必然失败 ────────────────────────────────
 # link(2) 被 app 域拒绝（P3 记的就是这件事），但 writeFileAtomic 在「新建且不许覆盖」
@@ -647,24 +633,23 @@ patch(
 # 修法与 P3 同源：锁文件给独占，rename 给原子，两者都不放弃。
 patch(
     "@deepseek-ai/dsh-fs-local/lib/index.js",
-    """		if (createIfAbsent !== void 0) try {
+    """		if (options.createIfAbsent) try {
 			await linkFile(tempPath, absolutePath);
 		} catch (error) {
-			await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+			await throwGuardedCreateFailure(error, absolutePath, displayPath, inspectPublicationTarget);
 		}""",
     """		/*
-		 * Android: an app domain is denied link(2), so the no-replace publication
-		 * above can never succeed there. A lock file keeps the exclusivity and the
-		 * rename keeps the atomicity -- the same serialization
-		 * dsh-session-persistence-jsonl uses for its logs. copyFile would keep
-		 * neither: it truncates the target and fills it over time.
+		 * Android: an app domain is denied link(2), so the no-replace publication above can
+		 * never succeed there. A lock file keeps the exclusivity and the rename keeps the
+		 * atomicity -- the same serialization dsh-session-persistence-jsonl uses for its logs.
+		 * copyFile would keep neither: it truncates the target and fills it over time.
 		 */
-		if (createIfAbsent !== void 0) try {
+		if (options.createIfAbsent) try {
 			await linkFile(tempPath, absolutePath);
 		} catch (error) {
 			const code = error?.code;
 			if (code !== "EACCES" && code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EXDEV") {
-				await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+				await throwGuardedCreateFailure(error, absolutePath, displayPath, inspectPublicationTarget);
 			}
 			const lockPath = `${absolutePath}.dsh-create.lock`;
 			const STALE_LOCK_MS = 30000;
@@ -678,10 +663,9 @@ patch(
 						throw lockError;
 					}
 					/*
-					 * A lock left behind by a killed process would otherwise make this
-					 * filename permanently uncreatable -- and the report would blame the
-					 * target, which does not exist. Break a lock that is old enough that
-					 * no live writer can still hold it (the retry window is 500 ms).
+					 * A lock left behind by a killed process would otherwise make this filename
+					 * permanently uncreatable -- and the report would blame the target, which does
+					 * not exist. Break a lock old enough that no live writer can still hold it.
 					 */
 					try {
 						const age = Date.now() - (await stat(lockPath)).mtimeMs;
@@ -695,11 +679,10 @@ patch(
 					}
 					if (attempt >= 20) {
 						/*
-						 * The lock is held. Only bypass it when it is old enough that no live
-						 * writer can still be inside the (tiny) inspect-and-rename window --
-						 * otherwise two writers would both rename and the later one would
-						 * silently overwrite the earlier, which is precisely what link(2)
-						 * exclusivity prevented.
+						 * The lock is held. Only bypass it when it is old enough that no live writer
+						 * can still be inside the (tiny) inspect-and-rename window -- otherwise two
+						 * writers would both rename and the later one would silently overwrite the
+						 * earlier, which is precisely what link(2) exclusivity prevented.
 						 */
 						let heldMs = 0;
 						try {
@@ -714,7 +697,7 @@ patch(
 							if (!isENOENT(inspectError) && !isENOTDIR(inspectError)) throw inspectError;
 						}
 						if (present !== void 0) {
-							await throwGuardedCreateFailure(lockError, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+							await throwGuardedCreateFailure(lockError, absolutePath, displayPath, inspectPublicationTarget);
 						}
 						if (heldMs < 2000) {
 							/* Fresh lock, absent target: someone is mid-publish. Say so clearly
@@ -725,12 +708,7 @@ patch(
 						}
 						console.error(`[dsh-fs] create-lock abandoned for ${Math.round(heldMs / 1000)}s; taking it over: ${absolutePath}`);
 						await rm(lockPath, { force: true });
-						try {
-							await rename(tempPath, absolutePath);
-						} finally {
-							/* Rename consumed the staging file; the lock is gone too, so the
-							 * next writer starts clean. */
-						}
+						await rename(tempPath, absolutePath);
 						return;
 					}
 					await new Promise((resolve) => setTimeout(resolve, 25));
@@ -746,7 +724,7 @@ patch(
 				if (existing !== void 0) {
 					const conflict = new Error(`EEXIST: ${absolutePath} already exists`);
 					conflict.code = "EEXIST";
-					await throwGuardedCreateFailure(conflict, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
+					await throwGuardedCreateFailure(conflict, absolutePath, displayPath, inspectPublicationTarget);
 				}
 				await rename(tempPath, absolutePath);
 			} finally {
@@ -758,112 +736,11 @@ patch(
     "P11 新建文件改用锁 + rename 发布",
 )
 
-# ── P19: 开机动画客户端在「页面重载瞬间」没有可重试的失败处理 ──────────────
-# 现场（/sdcard/DSH/work/client-retry-fix/HANDOFF.md、P18-P19.md）：
-#   resume/重载瞬间 /dsh-boot-animation/media/... 与 /plugins/events 各失败 1~2 次。
-#   空闲时两条端点实测都是健康的（媒体 200 + 1856280 B，SSE text/event-stream），
-#   所以不是缺路由、不是错 id —— 是页面重载瞬间的网络竞态。
-#   真缺陷在这里：媒体只有 25s「卡住超时」，没有 error 重试 → 首帧竞态会让开机动画整段跳过。
-# 交付：/sdcard/DSH/work/fixes-for-packaging/（成品 dsh-boot-animation-client.js，
-#       md5 99bb868ce27639e58c4ca771207b7138；原始 md5 30f60c790f4a3099dce2b16d041d8157）。
-# 说明：她的 blocks-P19.py 里 note 写的是中文标签（人读的），而本脚本的幂等判据是
-#       `if note in text:` —— 假 note 会让第二次运行重复插入（replacement 以锚点开头，
-#       锚点仍在文本里）。这里 anchor / replacement 一字未动，只把 note 换成各自
-#       replacement 里真实存在的子串（见 P16d 那条的同类说明）。
-#       P19d-1/2/3（fetchWithRetry）她的 blocks 文件里没有，是从她的 .orig→.patched
-#       逐行 diff 里原样取出的，没有改动她的任何逻辑。
-patch(
-    "dsh-boot-animation/lib/client.js",
-    """		/** How long an error stays readable before the overlay closes itself. */
-		const ERROR_LINGER_MS = 8e3;""",
-    """		/** How long an error stays readable before the overlay closes itself. */
-		const ERROR_LINGER_MS = 8e3;
-		/*
-		 * Delays for retrying the clip's first media request. Measured on device: a page
-		 * load can fail this request at t+1003ms AND at t+3630ms before it succeeds, so a
-		 * short window is not enough -- this schedule covers ~9.5s in total.
-		 */
-		const MEDIA_RETRY_DELAYS_MS = [300, 700, 1500, 3000, 4000];""",
-    "const MEDIA_RETRY_DELAYS_MS = [300, 700, 1500, 3000, 4000];",
-    "P19a 媒体首帧竞态：新增退避表 [300,700,1500,3000,4000]ms",
-)
-patch(
-    "dsh-boot-animation/lib/client.js",
-    """				video.addEventListener("playing", onPlaying);""",
-    """				video.addEventListener("playing", onPlaying);
-				/*
-				 * The first media request can race a page reload and fail at the network layer
-				 * although the route is healthy (measured: 200 + 1856280 B via curl, while the
-				 * WebView failed twice per load). Retry with backoff instead of waiting for the
-				 * 25s stall timeout, which skipped the whole clip.
-				 */
-				let mediaRetries = 0;
-				const onMediaError = () => {
-					if (closedRef.current || mediaRetries >= MEDIA_RETRY_DELAYS_MS.length) return;
-					const delay = MEDIA_RETRY_DELAYS_MS[mediaRetries];
-					mediaRetries += 1;
-					report("media error, retry " + String(mediaRetries) + " in " + String(delay) + "ms");
-					window.setTimeout(() => {
-						if (closedRef.current) return;
-						video.src = url;
-						video.load();
-						const again = video.play();
-						if (again !== void 0 && typeof again.catch === "function") again.catch(() => {});
-					}, delay);
-				};
-				video.addEventListener("error", onMediaError);""",
-    "const onMediaError = () => {",
-    "P19b 媒体 error 时按退避表重试 5 次（覆盖 ~9.5s）",
-)
-patch(
-    "dsh-boot-animation/lib/client.js",
-    """					video.removeEventListener("playing", onPlaying);""",
-    """					video.removeEventListener("playing", onPlaying);
-					video.removeEventListener("error", onMediaError);""",
-    'video.removeEventListener("error", onMediaError);',
-    "P19c 卸载时移除 error 监听",
-)
-patch(
-    "dsh-boot-animation/lib/client.js",
-    """		const BASE = "/dsh-boot-animation";""",
-    """		const BASE = "/dsh-boot-animation";
-		/*
-		 * Fetch with retries: a page load can reach the host before its loopback connection
-		 * is ready, and the first attempt then fails although the route is healthy (measured:
-		 * 200 + 1856280 B via curl while the WebView failed twice per load).
-		 */
-		async function fetchWithRetry(url, options, delays) {
-			const schedule = delays ?? [300, 700, 1500, 3000, 4000];
-			let last;
-			for (let attempt = 0; attempt <= schedule.length; attempt++) {
-				try {
-					return await fetch(url, options);
-				} catch (error) {
-					last = error;
-					if (attempt === schedule.length) break;
-					await new Promise((resolve) => setTimeout(resolve, schedule[attempt]));
-				}
-			}
-			throw last;
-		}""",
-    "async function fetchWithRetry(url, options, delays) {",
-    "P19d-1 目录/解析请求走带退避的 fetchWithRetry",
-)
-patch(
-    "dsh-boot-animation/lib/client.js",
-    """					const response = await fetch(this.#listUrl(), { cache: "no-store" });""",
-    """					const response = await fetchWithRetry(this.#listUrl(), { cache: "no-store" });""",
-    'await fetchWithRetry(this.#listUrl(), { cache: "no-store" })',
-    "P19d-2 目录清单改走 fetchWithRetry",
-)
-patch(
-    "dsh-boot-animation/lib/client.js",
-    """					const response = await fetch(`${RESOLVE_URL}?mode=${mode}${param === "" ? "" : "&" + param}`, { cache: "no-store" });""",
-    """					const response = await fetchWithRetry(`${RESOLVE_URL}?mode=${mode}${param === "" ? "" : "&" + param}`, { cache: "no-store" });""",
-    "await fetchWithRetry(`${RESOLVE_URL}?mode=${mode}",
-    "P19d-3 resolve 请求改走 fetchWithRetry",
-)
-
+# ── P19（作废）：开机动画客户端在「页面重载瞬间」没有可重试的失败处理 ────────
+# 0.2.0 时代的 dsh-boot-animation（BSD-3）在 0.2.1-rc.2 的依赖树里已经不存在，
+# 1.0.24/1.0.25 的载荷里也没有这个目录 —— 实测六条 P19 全部落在「文件不存在」。
+# 上游现在也没有再发布这个包（npm 404），所以整段删除，不再占门禁输出。
+# 开机动画的可重试逻辑若哪天回到依赖树里，按 HANDOVER §17 记录的原始锚点重放。
 
 # ── P20: 会话写租约在没有内核仲裁者（Android）时改用 mkdir 仲裁 ─────────────
 # 现场：Android 上 tryLockExclusive 是空实现（P2），于是两个进程可以同时「拿到」
@@ -1514,9 +1391,10 @@ patch(
 # MISSING_CREDENTIAL —— 尽管钥匙就在磁盘上、同一个账号也能用。
 # 这里在两条路都没结果时，直接读托管文档的 refs:（只读，不进环境）。
 patch(
-    "@deepseek-ai/dsh-llm-deepseek-api-key/lib/index.js",
-    """import { credentialRef } from "@deepseek-ai/dsh-credentials";""",
-    """import { credentialRef } from "@deepseek-ai/dsh-credentials";
+    "@deepseek-ai/dsh-llm-deepseek/lib/index.js",
+    """import { createHash } from "node:crypto";
+""",
+    """import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 /*
  * Android: last-resort credential read straight from the managed document.
@@ -1526,56 +1404,60 @@ import { readFileSync } from "node:fs";
  * here is materialized into the environment.
  */
 function managedCredential(ref) {
-\ttry {
-\t\tconst home = process.env.DSH_HOME ?? `${process.env.HOME ?? ""}/.dsh`;
-\t\tconst text = readFileSync(`${home}/.credentials.yaml`, "utf8");
-\t\tconst wanted = String(ref);
-\t\tlet inRefs = false;
-\t\tfor (const raw of text.split("\\n")) {
-\t\t\tconst trimmed = raw.trim();
-\t\t\tif (trimmed.length === 0 || trimmed.startsWith("#")) continue;
-\t\t\tif (raw.charAt(0) !== " " && raw.charAt(0) !== "\\t") {
-\t\t\t\tinRefs = trimmed === "refs:";
-\t\t\t\tcontinue;
-\t\t\t}
-\t\t\tif (!inRefs) continue;
-\t\t\tconst hit = raw.match(/^\\s+([A-Za-z0-9_]+)\\s*:\\s*(.+?)\\s*$/u);
-\t\t\tif (hit === null || hit[1] !== wanted) continue;
-\t\t\tconst value = hit[2].replace(/^["']|["']$/gu, "");
-\t\t\tif (value.length > 0) return value;
-\t\t}
-\t\treturn void 0;
-\t} catch (_unreadable) {
-\t\treturn void 0;
-\t}
-}""",
-    "last-resort credential read straight from the managed document",
+	try {
+		const home = process.env.DSH_HOME ?? `${process.env.HOME ?? ""}/.dsh`;
+		const text = readFileSync(`${home}/.credentials.yaml`, "utf8");
+		const wanted = String(ref);
+		let inRefs = false;
+		for (const raw of text.split("\\n")) {
+			const trimmed = raw.trim();
+			if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
+			if (raw.charAt(0) !== " " && raw.charAt(0) !== "\\t") {
+				inRefs = trimmed === "refs:";
+				continue;
+			}
+			if (!inRefs) continue;
+			const hit = raw.match(/^\\s+([A-Za-z0-9_]+)\\s*:\\s*(.+?)\\s*$/u);
+			if (hit === null || hit[1] !== wanted) continue;
+			const value = hit[2].replace(/^["']|["']$/gu, "");
+			if (value.length > 0) return value;
+		}
+		return void 0;
+	} catch (_unreadable) {
+		return void 0;
+	}
+}
+""",
+    "function managedCredential(ref) {",
     "P24 托管凭据文档直读（import）",
 )
+
 patch(
-    "@deepseek-ai/dsh-llm-deepseek-api-key/lib/index.js",
-    """\t\tif (credentials !== void 0) {
-\t\t\tconst hit = await credentials.resolve(ref);
-\t\t\tif (hit !== void 0) return assertUsableApiKey(hit.value, "llm-deepseek", ref);
-\t\t} else {
-\t\t\tconst ambient = launchEnvironmentOf(ctx).get(ref);
-\t\t\tif (ambient !== void 0 && ambient.value.length > 0) return assertUsableApiKey(ambient.value, "llm-deepseek", ref);
-\t\t}
-\t\tthrow new LlmError(`llm-deepseek: no API key""",
-    """\t\tif (credentials !== void 0) {
-\t\t\tlet hit;
-\t\t\ttry {
-\t\t\t\thit = await credentials.resolve(ref);
-\t\t\t} catch (error) {
-\t\t\t\tconsole.warn("[llm-deepseek] credentials service failed for " + String(ref) + ": " + (error && error.message ? error.message : String(error)));
-\t\t\t}
-\t\t\tif (hit !== void 0) return assertUsableApiKey(hit.value, "llm-deepseek", ref);
-\t\t}
-\t\tconst ambient = launchEnvironmentOf(ctx).get(ref);
-\t\tif (ambient !== void 0 && ambient.value.length > 0) return assertUsableApiKey(ambient.value, "llm-deepseek", ref);
-\t\tconst managed = managedCredential(ref);
-\t\tif (managed !== void 0) return assertUsableApiKey(managed, "llm-deepseek", ref);
-\t\tthrow new LlmError(`llm-deepseek: no API key""",
+    "@deepseek-ai/dsh-llm-deepseek/lib/index.js",
+    """	const credentials = ctx.get("credentials");
+	if (credentials !== void 0) {
+		const hit = await credentials.resolve(ref);
+		return hit === void 0 ? void 0 : assertUsableApiKey(hit.value, "llm-deepseek", ref);
+	}
+	const ambient = launchEnvironmentOf(ctx).get(ref);
+	return ambient === void 0 || ambient.value.length === 0 ? void 0 : assertUsableApiKey(ambient.value, "llm-deepseek", ref);""",
+    """	const credentials = ctx.get("credentials");
+	if (credentials !== void 0) {
+		/* P24: a credentials service that fails must not mask a key the managed document
+		 * still holds -- the file is the one source that is always present. */
+		let hit;
+		try {
+			hit = await credentials.resolve(ref);
+		} catch (error) {
+			console.warn("[llm-deepseek] credentials service failed for " + String(ref) + ": " + (error && error.message ? error.message : String(error)));
+		}
+		if (hit !== void 0) return assertUsableApiKey(hit.value, "llm-deepseek", ref);
+	}
+	const ambient = launchEnvironmentOf(ctx).get(ref);
+	if (ambient !== void 0 && ambient.value.length > 0) return assertUsableApiKey(ambient.value, "llm-deepseek", ref);
+	const managed = managedCredential(ref);
+	if (managed !== void 0) return assertUsableApiKey(managed, "llm-deepseek", ref);
+	return void 0;""",
     "const managed = managedCredential(ref);",
     "P24 托管凭据文档直读（回退链）",
 )
@@ -2197,15 +2079,13 @@ patch(
 # （「已请求在文件管理器中显示」），在 Android 上实际是拉起分享面板。
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """			return typeof host.name === "string" && typeof host.available === "boolean" && (host.fileManager === null || host.fileManager === "finder" || host.fileManager === "explorer" || host.fileManager === "directory");
-""",
-    """			/* "android" is a real answer, not a malformed one: there is no desktop file manager,
-			 * but open and reveal both reach the system share sheet (dsh-open -> /device/open),
-			 * so leaving it out of this whitelist turned every delivery card into
-			 * presented.hostError with a retry button that could never succeed. */
-			return typeof host.name === "string" && typeof host.available === "boolean" && (host.fileManager === null || host.fileManager === "finder" || host.fileManager === "explorer" || host.fileManager === "directory" || host.fileManager === "android");
-""",
-    '"android" is a real answer, not a malformed one',
+    """typeof host.available===`boolean`&&(host.fileManager===null||host.fileManager===`finder`||host.fileManager===`explorer`||host.fileManager===`directory`)""",
+    """/* "android" is a real answer, not a malformed one: there is no desktop file manager,
+ * but open and reveal both reach the system share sheet (dsh-open -> /device/open),
+ * so leaving it out of this whitelist turned every delivery card into
+ * presented.hostError with a retry button that could never succeed. */
+typeof host.available===`boolean`&&(host.fileManager===null||host.fileManager===`finder`||host.fileManager===`explorer`||host.fileManager===`directory`||host.fileManager===`android`)""",
+    "host.fileManager===`android`",
     "P29 交付卡片认 android 的 fileManager（否则恒 hostError）",
 )
 
@@ -2309,113 +2189,54 @@ patch(
 # 服务端不改：它接受的就是这四个值，我们只会送检测出来的这四个之一。
 patch(
     "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-    """		function isImageMediaType(value) {
-			return value === "image/png" || value === "image/jpeg" || value === "image/webp" || value === "image/gif";
-		}
-""",
-    """		function isImageMediaType(value) {
-			return value === "image/png" || value === "image/jpeg" || value === "image/webp" || value === "image/gif";
-		}
-		/**
-		 * Android's picker hands the browser an empty `type` -- or
-		 * `application/octet-stream` -- for perfectly valid images, so a draft that
-		 * trusted the declared MIME alone refused a plain screenshot as an
-		 * unsupported type. Twelve bytes are enough to let the signature decide; a
-		 * declared type that is already accepted stays the fast path and reads
-		 * nothing at all.
-		 */
-		const IMAGE_HEAD_BYTES = 12;
-		/**
-		 * Identify the supported image format of one file signature.
-		 * @param bytes - the first 12 bytes of the file.
-		 * @returns the detected media type, or undefined for any other bytes.
-		 */
-		function mediaTypeFromImageHeader(bytes) {
-			const length = bytes.length;
-			if (length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return "image/png";
-			if (length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
-			if (length >= 4 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
-			if (length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
-			return void 0;
-		}
-		/**
-		 * Media type of one browser file: the declared type when it is one of the
-		 * accepted four, otherwise the type its own signature declares.
-		 * @param file - the browser file (Blob-shaped; only `slice` is relied on).
-		 * @returns the media type, or undefined when neither source identifies one.
-		 */
-		async function resolveImageMediaType(file) {
-			if (isImageMediaType(file.type)) return file.type;
-			let head;
-			try {
-				head = new Uint8Array(await file.slice(0, IMAGE_HEAD_BYTES).arrayBuffer());
-			} catch {
-				return void 0;
-			}
-			return mediaTypeFromImageHeader(head);
-		}
-		/**
-		 * The same file carrying the media type its own signature declares, so every
-		 * later consumer agrees: `createDrafts` picks the image draft path from
-		 * `File.type`, `imageLimits` counts images by it, and `encodeImage` writes it
-		 * on the wire as the mediaType the host re-checks against the bytes.
-		 * @param file - the browser file.
-		 * @returns the original file, or a re-typed view of it when detection won.
-		 */
-		async function adoptImageMediaType(file) {
-			const mediaType = await resolveImageMediaType(file);
-			if (mediaType === void 0 || mediaType === file.type) return file;
-			return new File([file], file.name, {
-				type: mediaType,
-				lastModified: file.lastModified
-			});
-		}
-		/**
-		 * Wire media type of one image file. An unidentifiable file throws the same
-		 * error the declared-type whitelist threw, so its rejection is unchanged.
-		 * @param file - the browser file.
-		 * @returns the media type its declaration or its bytes select.
-		 */
-		async function imageMediaTypeOf(file) {
-			const mediaType = await resolveImageMediaType(file);
-			if (mediaType === void 0) throw new UnsupportedImageMediaTypeError(file.type);
-			return mediaType;
-		}
-""",
-    "Android's picker hands the browser an empty",
+    """function isImageMediaType(value){return value===`image/png`||value===`image/jpeg`||value===`image/webp`||value===`image/gif`}""",
+    """function isImageMediaType(value){return value===`image/png`||value===`image/jpeg`||value===`image/webp`||value===`image/gif`}
+/* P31a: Android's picker hands the browser an empty `type` -- or application/octet-stream
+ * -- for perfectly valid images, so a draft that trusted the declared MIME alone refused a
+ * plain screenshot as an unsupported type. Twelve bytes are enough to let the signature
+ * decide; a declared type that is already accepted stays the fast path and reads nothing. */
+function mediaTypeFromImageHeader(bytes){const length=bytes.length;
+	if(length>=8&&bytes[0]===0x89&&bytes[1]===0x50&&bytes[2]===0x4e&&bytes[3]===0x47&&bytes[4]===0x0d&&bytes[5]===0x0a&&bytes[6]===0x1a&&bytes[7]===0x0a)return`image/png`;
+	if(length>=3&&bytes[0]===0xff&&bytes[1]===0xd8&&bytes[2]===0xff)return`image/jpeg`;
+	if(length>=4&&bytes[0]===0x47&&bytes[1]===0x49&&bytes[2]===0x46&&bytes[3]===0x38)return`image/gif`;
+	if(length>=12&&bytes[0]===0x52&&bytes[1]===0x49&&bytes[2]===0x46&&bytes[3]===0x46&&bytes[8]===0x57&&bytes[9]===0x45&&bytes[10]===0x42&&bytes[11]===0x50)return`image/webp`;
+	return void 0}
+async function resolveImageMediaType(file){if(isImageMediaType(file.type))return file.type;let head;
+	try{head=new Uint8Array(await file.slice(0,12).arrayBuffer())}catch{return void 0}
+	return mediaTypeFromImageHeader(head)}
+/* P31a: the same file carrying the media type its own signature declares, so every later
+ * consumer agrees: the draft path, the image limits and the wire mediaType all read File.type. */
+async function adoptImageMediaType(file){const mediaType=await resolveImageMediaType(file);
+	if(mediaType===void 0||mediaType===file.type)return file;
+	return new File([file],file.name,{type:mediaType,lastModified:file.lastModified})}
+/* Wire media type of one image file; an unidentifiable file throws what the whitelist threw. */
+async function imageMediaTypeOf(file){const mediaType=await resolveImageMediaType(file);
+	if(mediaType===void 0)throw new UnsupportedImageMediaTypeError(file.type);
+	return mediaType}""",
+    "function mediaTypeFromImageHeader(bytes){const length=bytes.length;",
     "P31a 图片类型：空/未知 MIME 按 magic 判（12 字节）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-    """			async encodeImage(file) {
-				return {
-					mediaType: imageMediaType(file.type),
-""",
-    """			async encodeImage(file) {
-				return {
-					mediaType: await imageMediaTypeOf(file),
-""",
-    "mediaType: await imageMediaTypeOf(file)",
+    """async encodeImage(file){return{mediaType:imageMediaType(file.type),data:await base64ImageOf(file),""",
+    """async encodeImage(file){return{mediaType:await imageMediaTypeOf(file),data:await base64ImageOf(file),""",
+    "mediaType:await imageMediaTypeOf(file)",
     "P31b 上传用的 mediaType 跟着检测结果走（不然服务端按字节复核仍会对不上）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-    """			const intakeFiles = (0, react.useCallback)((files, directories) => {
-				if (locked || machineBusy || subagent !== null && !continuable || addFiles === void 0 || files.length === 0) return;
-""",
-    """			const intakeFiles = (0, react.useCallback)(async (files, directories) => {
-				if (locked || machineBusy || subagent !== null && !continuable || addFiles === void 0 || files.length === 0) return;
-				/* Everything below classifies synchronously from `File.type` -- `addFiles`
-				 * starts the image draft path, the limits count images, the continuable gate
-				 * rejects non-images -- so the picker's wrong MIME is corrected once, here,
-				 * before any of them runs. Nothing is read when the type is already good. */
-				const adopted = await Promise.all(files.map(adoptImageMediaType));
-				if (adopted.some((file, index) => file !== files[index])) {
-					if (directories !== void 0) directories = new Set([...directories].map((entry) => adopted[files.indexOf(entry)] ?? entry));
-					files = adopted;
-				}
-""",
-    "const adopted = await Promise.all(files.map(adoptImageMediaType));",
+    """const intakeFiles=(0,react.useCallback)((files,directories)=>{if(uploadDenied||locked||machineBusy||subagent!==null&&!continuable||addFiles===void 0||files.length===0)return;const rejected=(()=>{""",
+    """const intakeFiles=(0,react.useCallback)(async(files,directories)=>{if(uploadDenied||locked||machineBusy||subagent!==null&&!continuable||addFiles===void 0||files.length===0)return;
+/* P31c: everything below classifies synchronously from `File.type` -- addFiles starts the
+ * image draft path, the limits count images, the continuable gate rejects non-images -- so
+ * the picker's wrong MIME is corrected once, here, before any of them runs. Nothing is read
+ * when the type is already good. */
+const adopted=await Promise.all(files.map(adoptImageMediaType));
+if(adopted.some((file,index)=>file!==files[index])){if(directories!==void 0)directories=new Set([...directories].map(entry=>adopted[files.indexOf(entry)]??entry));files=adopted}
+const rejected=(()=>{""",
+    "const adopted=await Promise.all(files.map(adoptImageMediaType));",
     "P31c 收文件闸门先补类型（addFiles / 数量限制 / 可续会话判据都读 File.type）",
 )
 
@@ -2559,37 +2380,32 @@ patch(
 # —— 声明类型和字节对不上，用户能做的还是「换一张/重选」。
 patch(
     "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-    """			"image.unsupportedType": "仅支持 PNG、JPG、WebP、GIF 格式的图片",
-""",
-    """			"image.unsupportedType": "仅支持 PNG、JPG、WebP、GIF 格式的图片",
-			"image.decodeFailed": "图片解码失败（格式异常），请换一张图或重新导出后再试",
-""",
-    "图片解码失败（格式异常）",
+    """"image.unsupportedType":`仅支持 PNG、JPG、WebP、GIF 格式的图片`,""",
+    """"image.unsupportedType":`仅支持 PNG、JPG、WebP、GIF 格式的图片`,
+			/* P33a: a decode failure is not a type rejection. */
+			"image.decodeFailed":`图片解码失败（格式异常），请换一张图或重新导出后再试`,""",
+    "\"image.decodeFailed\":`图片解码失败（格式异常），请换一张图或重新导出后再试`",
     "P33a 解码失败的中文文案（与「类型不支持」分开）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-    """			"image.unsupportedType": "Only PNG, JPG, WebP, and GIF images are supported",
-""",
-    """			"image.unsupportedType": "Only PNG, JPG, WebP, and GIF images are supported",
-			"image.decodeFailed": "Image could not be decoded (unexpected format); try another image or re-export it",
-""",
-    "Image could not be decoded (unexpected format)",
+    """"image.unsupportedType":`Only PNG, JPG, WebP, and GIF images are supported`,""",
+    """"image.unsupportedType":`Only PNG, JPG, WebP, and GIF images are supported`,
+			/* P33b: same split in English. */
+			"image.decodeFailed":`Image could not be decoded (unexpected format); try another image or re-export it`,""",
+    "\"image.decodeFailed\":`Image could not be decoded (unexpected format); try another image or re-export it`",
     "P33b 解码失败的英文文案",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-    """				case "INVALID_IMAGE":
-				case "IMAGE_TYPE_MISMATCH": return t("image.unsupportedType");
-""",
-    """				/* P33: a decode failure and a type rejection used to share one sentence, so a
-				 * camera JPEG the host decoder choked on was reported as "only PNG/JPG/WebP/GIF
-				 * are supported" -- which is exactly what sent the last investigation after the
-				 * wrong gate. Say which of the two actually happened. */
-				case "INVALID_IMAGE": return t("image.decodeFailed");
-				case "IMAGE_TYPE_MISMATCH": return t("image.unsupportedType");
-""",
-    'case "INVALID_IMAGE": return t("image.decodeFailed");',
+    """case`INVALID_IMAGE`:case`IMAGE_TYPE_MISMATCH`:return t(`image.unsupportedType`);""",
+    """/* P33c: a decode failure and a type rejection used to share one sentence, so a camera JPEG
+ * the host decoder choked on was reported as "only PNG/JPG/WebP/GIF are supported" -- which
+ * is exactly what sent the last investigation after the wrong gate. */
+case`INVALID_IMAGE`:return t(`image.decodeFailed`);case`IMAGE_TYPE_MISMATCH`:return t(`image.unsupportedType`);""",
+    "case`INVALID_IMAGE`:return t(`image.decodeFailed`);",
     "P33c INVALID_IMAGE 改用解码失败文案（IMAGE_TYPE_MISMATCH 保持类型那句）",
 )
 
@@ -2617,67 +2433,41 @@ patch(
 # 不在客户端新造探测（不看 UA、不看平台名）—— fileManager 是唯一判据。
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """							actions: renderSlot("deliverables.file.actions", {
-								actionUrl: presentedFileUrl(sessionId, file.seq, file.index),
-								available: host !== null && host !== "error" && host.available,
-""",
-    """							/* P34: android hides reveal -- host.fileManager is the judgement P29 already
-							 * established ("android" is a real answer, not a malformed one). There is no
-							 * file manager to reveal into on Android, and the App exposes no reveal intent,
-							 * so the slot is told to drop that one action instead of drawing a folder button
-							 * whose every click ends in revealError. Nothing else on the card changes. */
-							actions: renderSlot("deliverables.file.actions", {
-								actionUrl: presentedFileUrl(sessionId, file.seq, file.index),
-								available: host !== null && host !== "error" && host.available,
-								reveal: host === null || host === "error" ? true : host.fileManager !== "android",
-""",
-    'P34: android hides reveal',
+    """actions:renderSlot(`deliverables.file.actions`,{actionUrl:presentedFileUrl(sessionId,file.seq,file.index),available:host!==null&&host!==`error`&&host.available,pending:""",
+    """/* P34a: android hides reveal -- host.fileManager is the judgement P29 already established
+ * ("android" is a real answer, not a malformed one). There is no file manager to reveal
+ * into on Android and the App exposes no reveal intent, so the slot is told to drop that
+ * one action instead of drawing a folder button whose every click ends in revealError.
+ * Nothing else on the card changes. */
+actions:renderSlot(`deliverables.file.actions`,{actionUrl:presentedFileUrl(sessionId,file.seq,file.index),available:host!==null&&host!==`error`&&host.available,reveal:host===null||host===`error`?true:host.fileManager!==`android`,pending:""",
+    "reveal:host===null||host===`error`?true:host.fileManager!==`android`,pending:",
     "P34a 交付卡片把 fileManager 判据传给动作插槽（android 时 reveal:false）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			const hasMenu = props.loading === true || props.failed || applications.length + (kind === "file" ? 1 : 0) > 1;
-			const revealDefault = kind === "file" && preferred === void 0 && props.loading !== true;
-			const primaryLabel = preferred === void 0 ? t("path.reveal") : t("open.title", { app: preferred.name });
-""",
-    """			/* P34: android hides reveal -- callers pass reveal:false when the Host reports
-			 * fileManager "android". Only the reveal entry goes away: the application list,
-			 * its retry entry, and the plain "open" fallback keep rendering. */
-			const revealOffered = kind !== "file" || props.reveal !== false;
-			const hasMenu = props.loading === true || props.failed || applications.length + (kind === "file" && revealOffered ? 1 : 0) > 1;
-			const revealDefault = kind === "file" && revealOffered && preferred === void 0 && props.loading !== true;
-			const primaryLabel = preferred === void 0 ? t(revealOffered ? "path.reveal" : "path.open") : t("open.title", { app: preferred.name });
-""",
-    'P34: android hides reveal',
+    """const hasMenu=props.loading===true||props.failed||applications.length+(kind===`file`?1:0)>1;const revealDefault=kind===`file`&&preferred===void 0&&props.loading!==true;const primaryLabel=preferred===void 0?t(`path.reveal`):t(`open.title`,{app:preferred.name});""",
+    """/* P34b: android hides reveal -- callers pass reveal:false when the Host reports fileManager
+ * "android". Only the reveal entry goes away: the application list, its retry entry, and the
+ * plain "open" fallback keep rendering. */
+const revealOffered=kind!==`file`||props.reveal!==false;const hasMenu=props.loading===true||props.failed||applications.length+(kind===`file`&&revealOffered?1:0)>1;const revealDefault=kind===`file`&&revealOffered&&preferred===void 0&&props.loading!==true;const primaryLabel=preferred===void 0?t(revealOffered?`path.reveal`:`path.open`):t(`open.title`,{app:preferred.name});""",
+    "const revealOffered=kind!==`file`||props.reveal!==false;",
     "P34b 渲染层：revealOffered 决定主按钮是「显示文件位置」还是「打开」，并把它计入菜单项数",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """				footer: kind === "file" ? [{
-					id: "reveal",
-""",
-    """				footer: kind === "file" && revealOffered ? [{
-					id: "reveal",
-""",
-    'footer: kind === "file" && revealOffered ? [{',
+    """footer:kind===`file`?[{id:`reveal`,""",
+    """footer:kind===`file`&&revealOffered?[{id:`reveal`,""",
+    "footer:kind===`file`&&revealOffered?[{id:`reveal`,",
     "P34c 菜单 footer 里的 reveal 项按 revealOffered 决定是否出现",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			const association = useFileApplications(props.actionUrl, queryRoute, props.available);
-			if (!props.available) return null;
-			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
-				kind: "file",
-				applications: association.apps,
-""",
-    """			const association = useFileApplications(props.actionUrl, queryRoute, props.available);
-			if (!props.available) return null;
-			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
-				kind: "file",
-				reveal: props.reveal !== false,
-				applications: association.apps,
-""",
-    'reveal: props.reveal !== false,',
+    """return(0,react_jsx_runtime.jsx)(OpenTargetButton,{kind:`file`,applications:association.apps,defaultId:association.apps.find(app=>app.default)?.id,failed:association.failed,""",
+    """return(0,react_jsx_runtime.jsx)(OpenTargetButton,{kind:`file`,reveal:props.reveal!==false,applications:association.apps,defaultId:association.apps.find(app=>app.default)?.id,failed:association.failed,""",
+    "kind:`file`,reveal:props.reveal!==false,",
     "P34d 卡片动作把 reveal 标记交给渲染层（其它调用方不传 = 保持原样）",
 )
 
@@ -2692,19 +2482,12 @@ patch(
 # 不在客户端新造探测。
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """										available: native,
-										pending: phase === "opening" || phase === "revealing",
-										onAction: (action, application) => openChanged(sessionId, seq, index, action, application)
-""",
-    """										available: native,
-										/* P34e: android hides reveal -- the review pane renders the same slot as the card, so it
-										 * takes the same judgement: host.fileManager is the Host's own answer, already read here
-										 * for `native`, and "android" means there is no file manager to reveal into. No probe. */
-										reveal: host === null || host === "error" ? true : host.fileManager !== "android",
-										pending: phase === "opening" || phase === "revealing",
-										onAction: (action, application) => openChanged(sessionId, seq, index, action, application)
-""",
-    "P34e: android hides reveal",
+    """renderSlot(`deliverables.review.file.actions`,{actionUrl:changedFileUrl(sessionId,seq,index),available:native,pending:""",
+    """/* P34e: android hides reveal -- the review pane renders the same slot as the card, so it
+ * takes the same judgement: host.fileManager is the Host's own answer, already read here
+ * for `native`, and "android" means there is no file manager to reveal into. No probe. */
+renderSlot(`deliverables.review.file.actions`,{actionUrl:changedFileUrl(sessionId,seq,index),available:native,reveal:host===null||host===`error`?true:host.fileManager!==`android`,pending:""",
+    "available:native,reveal:host===null",
     "P34e review 面板把同一判据传给同一个插槽（android 时 reveal:false）",
 )
 
@@ -2733,165 +2516,100 @@ patch(
 # []），这条分支今天不可达，故只记在这里，不扩大改动面。
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
-				kind: "file",
-				applications: apps,
-""",
-    """			return (0, react_jsx_runtime.jsx)(OpenTargetButton, {
-				kind: "file",
+    """return(0,react_jsx_runtime.jsx)(OpenTargetButton,{kind:`file`,applications:apps,""",
+    """return(0,react_jsx_runtime.jsx)(OpenTargetButton,{kind:`file`,
 				/* P35a: forward the reveal decision. FileOpenTarget is the third caller of
 				 * OpenTargetButton and the only one that dropped it, so props.reveal stayed undefined
 				 * here and the guard in OpenTargetButton (`props.reveal !== false`) never fired --
 				 * which is why the document-preview header kept its folder button on Android. */
-				reveal: props.reveal !== false,
-				applications: apps,
-""",
-    'P35a: forward the reveal decision',
+				reveal:props.reveal!==false,applications:apps,""",
+    "/* P35a: forward the reveal decision.",
     "P35a 文档预览的 FileOpenTarget 把 reveal 转给 OpenTargetButton",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """		/** Page-lifetime desktop availability and the open/reveal carrier shared by every path control. */
-""",
-    """		/* P35b: the Host's destination metadata, browser-relative. This is the same route --
-		 * and the same `fileManager` field -- P29/P34 read for delivery cards; the document
-		 * preview receives no Host object (its plugin injects no host/desktop service and the
-		 * Session Remote exposes canOpenWorkspacePath, a boolean, not the destination), so the
-		 * renderer asks the Host instead of inventing a probe. The value is the same
-		 * browser-relative form deliverables derives with PRESENT_HOST_PATH.slice(1) -- drop the
-		 * "api/" prefix and the read 404s, which silently restores the old behaviour. */
-		const PRESENT_HOST_ROUTE = "api/present.host";
-		/** Page-lifetime desktop availability and the open/reveal carrier shared by every path control. */
-""",
-    "P35b: the Host's destination metadata",
+    """var OpenInAppPathController=class{remote;""",
+    """/* P35b: the Host's destination metadata, browser-relative. This is the same route -- and the
+ * same `fileManager` field -- P29/P34 read for delivery cards; the document preview receives no
+ * Host object (its plugin injects no host/desktop service and the Session Remote exposes
+ * canOpenWorkspacePath, a boolean, not the destination), so the renderer asks the Host instead
+ * of inventing a probe. The value is the same browser-relative form deliverables derives with
+ * PRESENT_HOST_PATH.slice(1) -- drop the "api/" prefix and the read 404s, which silently
+ * restores the old behaviour. */
+const PRESENT_HOST_ROUTE=`api/present.host`;
+var OpenInAppPathController=class{remote;""",
+    "const PRESENT_HOST_ROUTE=`api/present.host`;",
     "P35b 预览页的判据来源：宿主自己的 present.host（不在客户端新造探测）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			/** Whether the Host desktop can open paths; null until the Host answered, false also after a failed read. */
-			desktop = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)(null);
-""",
-    """			/** Whether the Host desktop can open paths; null until the Host answered, false also after a failed read. */
-			desktop = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)(null);
-			/* P35b: the Host's file-manager answer ("android" means there is no file manager to
-			 * reveal into). null = not answered yet or the route is not served here. */
-			fileManager = (0, _deepseek_ai_dsh_client_store.createSnapshotStore)(null);
-""",
-    "P35b: the Host's file-manager answer",
+    """var OpenInAppPathController=class{remote;desktop=(0,_deepseek_ai_dsh_client_store.createSnapshotStore)(null);""",
+    """var OpenInAppPathController=class{remote;desktop=(0,_deepseek_ai_dsh_client_store.createSnapshotStore)(null);
+	/* P35b: the Host's file-manager answer ("android" means there is no file manager to
+	 * reveal into). null = not answered yet or the route is not served here. */
+	fileManager=(0,_deepseek_ai_dsh_client_store.createSnapshotStore)(null);""",
+    "fileManager=(0,_deepseek_ai_dsh_client_store.createSnapshotStore)(null);",
     "P35b 渲染方保存宿主的 fileManager（null = 未答/无此路由）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			async run() {
-				let available = false;
-				try {
-					const result = await this.remote.session.canOpenWorkspacePath();
-					available = result.ok && result.value;
-				} catch {}
-				this.desktop.set(available);
-			}
-""",
-    """			async run() {
-				let available = false;
-				try {
-					const result = await this.remote.session.canOpenWorkspacePath();
-					available = result.ok && result.value;
-				} catch {}
-				this.desktop.set(available);
+    """this.desktop.set(available)}};""",
+    """this.desktop.set(available);
 				/* P35b: read the destination in the same page-lifetime pass. A missing route
 				 * (deliverables not deployed) leaves it null, and null keeps the old behaviour. */
-				let manager = null;
-				try {
-					const response = await fetch(PRESENT_HOST_ROUTE);
-					if (response.ok) {
-						const destination = await response.json();
-						if (destination !== null && typeof destination === "object" && typeof destination.fileManager === "string") manager = destination.fileManager;
-					}
-				} catch {}
-				this.fileManager.set(manager);
-			}
-""",
-    'P35b: read the destination in the same page-lifetime pass',
+				let manager=null;
+				try{const response=await fetch(PRESENT_HOST_ROUTE);if(response.ok){const destination=await response.json();if(destination!==null&&typeof destination===`object`&&typeof destination.fileManager===`string`)manager=destination.fileManager}}catch{}
+				this.fileManager.set(manager)}};""",
+    "this.fileManager.set(manager)",
     "P35b 控制器一次读里同时取回 fileManager",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			const pathInjected = () => ({
-				hooks: { openInAppDesktop: paths.desktop },
-""",
-    """			const pathInjected = () => ({
-				/* P35b: the document-preview slots get the same two hooks the card slots get, so the
-				 * reveal decision is made where the button is rendered. */
-				hooks: { openInAppDesktop: paths.desktop, openInAppFileManager: paths.fileManager },
-""",
-    'P35b: the document-preview slots get the same two hooks',
+    """const pathInjected=()=>({hooks:{openInAppDesktop:paths.desktop},""",
+    """/* P35b: the document-preview slots get the same two hooks the card slots get, so the reveal
+ * decision is made where the button is rendered. */
+const pathInjected=()=>({hooks:{openInAppDesktop:paths.desktop,openInAppFileManager:paths.fileManager},""",
+    "openInAppFileManager:paths.fileManager",
     "P35b 文档预览插槽多注入一个 fileManager hook",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """		function FileOpenTarget(props) {
-			const desktop = props.useOpenInAppDesktop((value) => value);
-""",
-    """		function FileOpenTarget(props) {
-			const desktop = props.useOpenInAppDesktop((value) => value);
-			const fileManager = props.useOpenInAppFileManager((value) => value);
-""",
-    'const fileManager = props.useOpenInAppFileManager((value) => value);',
+    """function FileOpenTarget(props){const desktop=props.useOpenInAppDesktop(value=>value);""",
+    """function FileOpenTarget(props){const desktop=props.useOpenInAppDesktop(value=>value);const fileManager=props.useOpenInAppFileManager(value=>value);""",
+    "const fileManager=props.useOpenInAppFileManager(value=>value);",
     "P35b FileOpenTarget 读宿主的 fileManager",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """				reveal: props.reveal !== false,
-				applications: apps,
-""",
-    """				/* P35b: an explicit caller still wins (the delivery card passes false on Android);
+    """reveal:props.reveal!==false,applications:apps,""",
+    """/* P35b: an explicit caller still wins (the delivery card passes false on Android);
 				 * otherwise the Host's own answer decides, and only "android" drops reveal. */
-				reveal: props.reveal !== false && fileManager !== "android",
-				applications: apps,
-""",
-    'reveal: props.reveal !== false && fileManager !== "android",',
+				reveal:props.reveal!==false&&fileManager!==`android`,applications:apps,""",
+    "reveal:props.reveal!==false&&fileManager!==`android`,",
     "P35b 预览页按宿主判据决定 reveal（android 时不渲染）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			async openPath(path, action, application) {
-				const request = action === "reveal" ? {
-					path,
-					action
-				} : {
-					path,
-					...application === void 0 ? {} : { application }
-				};
-				let ok = false;
-				try {
-					ok = (await this.remote.session.openWorkspacePath(request)).ok;
-				} catch {}
-				return ok ? null : action === "open" ? "openError" : "revealError";
-			}
-""",
-    """			async openPath(path, action, application) {
-				const request = action === "reveal" ? {
-					path,
-					action
-				} : {
-					path,
-					...application === void 0 ? {} : { application }
-				};
-				let ok = false;
-				try {
-					ok = (await this.remote.session.openWorkspacePath(request)).ok;
-				} catch {}
+    """async openPath(path,action,application){const request=action===`reveal`?{path,action}:{path,...application===void 0?{}:{application}};let ok=false;try{ok=(await this.remote.session.openWorkspacePath(request)).ok}catch{}if(ok)return{kind:action===`reveal`?`revealed`:`opened`};return{kind:`failed`,failure:action===`open`?`openError`:`revealError`}}""",
+    """async openPath(path,action,application){const request=action===`reveal`?{path,action}:{path,...application===void 0?{}:{application}};let ok=false;try{ok=(await this.remote.session.openWorkspacePath(request)).ok}catch{}
+				if(ok)return{kind:action===`reveal`?`revealed`:`opened`};
 				/* P35c: the preview header has no present.open coordinates, so this call is its only
 				 * route to the opener. On Android that opener IS the share handoff (dsh-open ->
 				 * /device/open); a failure is not a missing Host desktop and "try again" is not the
 				 * advice to give. Desktop keeps its own two failure kinds. */
-				const shareFailed = action === "open" && this.fileManager.getSnapshot() === "android";
-				return ok ? null : action === "open" ? shareFailed ? "openShareFailed" : "openError" : "revealError";
-			}
-""",
-    'shareFailed ? "openShareFailed" : "openError"',
+				const shareFailed=action===`open`&&this.fileManager.getSnapshot()===`android`;
+				return{kind:`failed`,failure:action===`open`?shareFailed?`openShareFailed`:`openError`:`revealError`}}""",
+    "const shareFailed=action===`open`",
     "P35c 预览页的打开失败同样不再说「请重试」",
 )
+
 patch(
     "@deepseek-ai/dsh-native-command/lib/index.js",
     """/** Dispatch one shell-free platform command for the requested open intent. */
@@ -3023,95 +2741,92 @@ patch(
 )
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """					if (!response.ok) phase = response.status === 422 ? "nativeUnavailable" : failure;
-""",
-    """					if (!response.ok) phase = response.status === 422 ? "nativeUnavailable" : failure;
+    """if(!response.ok)phase=response.status===422?`nativeUnavailable`:failure}catch{phase=failure}""",
+    """if(!response.ok)phase=response.status===422?`nativeUnavailable`:failure;
 					/* P35c: 502 carries the Android handoff step (see the Host half). Two outcomes are
 					 * worth telling apart: the path is gone, or the share handoff itself was refused. */
-					if (response.status === 502) {
-						const refusal = await response.json().catch(() => void 0);
-						if (refusal !== void 0 && refusal.step === "android-open") phase = refusal.stage === "missing" ? "androidOpenMissing" : "androidOpenFailed";
-					}
-""",
-    'P35c: 502 carries the Android handoff step',
+					if(response.status===502){const refusal=await response.json().catch(()=>void 0);if(refusal!==void 0&&refusal.step===`android-open`)phase=refusal.stage===`missing`?`androidOpenMissing`:`androidOpenFailed`}}catch{phase=failure}""",
+    "refusal.step===`android-open`",
     "P35c 客户端：读 502 的失败步骤（missing / 其它）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """				return phase === "opened" || phase === "revealed" ? null : action === "reveal" ? "revealError" : "openError";
-""",
-    """				/* P35c: a failed Android handoff must not come back as "open failed, try again" --
+    """if(phase===void 0)return{kind:action===`open`?`opened`:`revealed`};return{kind:`failed`,failure:action===`reveal`?`revealError`:`openError`}""",
+    """if(phase===void 0)return{kind:action===`open`?`opened`:`revealed`};
+				/* P35c: a failed Android handoff must not come back as "open failed, try again" --
 				 * neither retry nor "Host desktop" describes what happened. */
-				return phase === "opened" || phase === "revealed" ? null : phase === "androidOpenMissing" ? "openMissing" : phase === "androidOpenFailed" ? "openShareFailed" : action === "reveal" ? "revealError" : "openError";
-""",
-    'P35c: a failed Android handoff must not come back',
+				return{kind:`failed`,failure:phase===`androidOpenMissing`?`openMissing`:phase===`androidOpenFailed`?`openShareFailed`:action===`reveal`?`revealError`:`openError`}""",
+    "phase===`androidOpenFailed`?`openShareFailed`",
     "P35c 客户端：失败回具体的文案键（不再一律 openError）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """			const status = phase === void 0 ? cardDescription(file.description, metadata) : t(reveal === "directory" && phase === "revealed" ? "presented.directoryOpened" : reveal === "directory" && phase === "revealing" ? "presented.directoryOpening" : reveal === "directory" && phase === "revealError" ? "presented.directoryError" : `presented.${phase}`);
-""",
-    """			const status = phase === void 0 ? cardDescription(file.description, metadata) : t(reveal === "directory" && phase === "revealed" ? "presented.directoryOpened" : reveal === "directory" && phase === "revealing" ? "presented.directoryOpening" : reveal === "directory" && phase === "revealError" ? "presented.directoryError" : phase === "androidOpenMissing" ? "presented.androidOpenMissing" : phase === "androidOpenFailed" ? "presented.androidOpenFailed" : `presented.${phase}`);
-""",
-    'phase === "androidOpenMissing" ? "presented.androidOpenMissing"',
+    """:reveal===`directory`&&phase===`revealError`?`presented.directoryError`:`presented.${phase}`);""",
+    """:reveal===`directory`&&phase===`revealError`?`presented.directoryError`:phase===`androidOpenMissing`?`presented.androidOpenMissing`:phase===`androidOpenFailed`?`presented.androidOpenFailed`:`presented.${phase}`);""",
+    "presented.androidOpenMissing`:phase===`androidOpenFailed`",
     "P35c 卡片：Android 失败的两种文案（文件不在了 / 分享通道没接住）",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """								"data-error": phase === "error" || phase === "revealError" || phase === "nativeUnavailable" ? true : void 0,
-""",
-    """								"data-error": phase === "error" || phase === "revealError" || phase === "nativeUnavailable" || phase === "androidOpenFailed" || phase === "androidOpenMissing" ? true : void 0,
-""",
-    '"androidOpenFailed" || phase === "androidOpenMissing" ? true',
+    """"data-error":phase===`error`||phase===`revealError`||phase===`nativeUnavailable`?true:void 0""",
+    """"data-error":phase===`error`||phase===`revealError`||phase===`nativeUnavailable`||phase===`androidOpenFailed`||phase===`androidOpenMissing`?true:void 0""",
+    "||phase===`androidOpenMissing`?true:void 0",
     "P35c 卡片：两种 Android 失败都按错误样式显示",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """			"presented.nativeUnavailable": "此文件没有可用的主机路径，请在侧边栏预览",
-""",
-    """			"presented.nativeUnavailable": "此文件没有可用的主机路径，请在侧边栏预览",
+    """"presented.nativeUnavailable":`此文件没有可用的主机路径，请在侧边栏预览`,""",
+    """"presented.nativeUnavailable":`此文件没有可用的主机路径，请在侧边栏预览`,
 			/* P35c: Android 的打开是「本 App 的分享通道」，失败要说清停在哪一步。 */
-			"presented.androidOpenMissing": "打开失败：文件已不在原路径",
-			"presented.androidOpenFailed": "打开失败：系统分享面板没有接住这个文件",
-""",
-    '"presented.androidOpenFailed": "打开失败：系统分享面板没有接住这个文件"',
+			"presented.androidOpenMissing":`打开失败：文件已不在原路径`,
+			"presented.androidOpenFailed":`打开失败：系统分享面板没有接住这个文件`,""",
+    "\"presented.androidOpenFailed\":`打开失败：系统分享面板没有接住这个文件`",
     "P35c 中文文案：Android 打开失败的两种",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-    """			"presented.nativeUnavailable": "This file has no available Host path. Preview it in the sidebar.",
-""",
-    """			"presented.nativeUnavailable": "This file has no available Host path. Preview it in the sidebar.",
+    """"presented.nativeUnavailable":`This file has no available Host path. Preview it in the sidebar.`,""",
+    """"presented.nativeUnavailable":`This file has no available Host path. Preview it in the sidebar.`,
 			/* P35c: Android opens through this App's share sheet; name the step that failed. */
-			"presented.androidOpenMissing": "Could not open: the file is no longer at that path",
-			"presented.androidOpenFailed": "Could not open: the share sheet did not accept this file",
-""",
-    '"presented.androidOpenFailed": "Could not open: the share sheet did not accept this file"',
+			"presented.androidOpenMissing":`Could not open: the file is no longer at that path`,
+			"presented.androidOpenFailed":`Could not open: the share sheet did not accept this file`,""",
+    "\"presented.androidOpenFailed\":`Could not open: the share sheet did not accept this file`",
     "P35c 英文文案：Android 打开失败的两种",
 )
+
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			"path.openError": "打开失败，请重试",
-""",
-    """			"path.openError": "打开失败，请重试",
+    """"path.openError":`打开失败，请重试`,""",
+    """"path.openError":`打开失败，请重试`,
 			/* P35c: Android handoff failures -- "try again" is wrong advice for both. */
-			"path.openMissing": "打开失败：文件已不在原路径",
-			"path.openShareFailed": "打开失败：系统分享面板没有接住这个文件",
-""",
-    '"path.openShareFailed": "打开失败：系统分享面板没有接住这个文件"',
+			"path.openMissing":`打开失败：文件已不在原路径`,
+			"path.openShareFailed":`打开失败：系统分享面板没有接住这个文件`,""",
+    "\"path.openShareFailed\":`打开失败：系统分享面板没有接住这个文件`",
     "P35c 中文 toast 文案：不再一律「请重试」",
+)
+
+patch(
+    "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
+    """"path.openError":`Could not open. Try again.`,""",
+    """"path.openError":`Could not open. Try again.`,
+			/* P35c: Android handoff failures -- "try again" is wrong advice for both. */
+			"path.openMissing":`Could not open: the file is no longer at that path`,
+			"path.openShareFailed":`Could not open: the share sheet did not accept this file`,""",
+    "\"path.openShareFailed\":`Could not open: the share sheet did not accept this file`",
+    "P35c 英文 toast 文案：不再一律 Try again",
 )
 patch(
     "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-    """			"path.openError": "Could not open. Try again.",
-""",
-    """			"path.openError": "Could not open. Try again.",
-			/* P35c: Android handoff failures -- "try again" is wrong advice for both. */
-			"path.openMissing": "Could not open: the file is no longer at that path",
-			"path.openShareFailed": "Could not open: the share sheet did not accept this file",
-""",
-    '"path.openShareFailed": "Could not open: the share sheet did not accept this file"',
-    "P35c 英文 toast 文案：不再一律 Try again",
+    """text:t(toast.failure===`revealError`?`path.revealError`:`path.openError`)""",
+    """/* P35c: a failed handoff names its own step; desktop keeps its two kinds. */
+text:t(toast.failure===`revealError`?`path.revealError`:toast.failure===`openShareFailed`?`path.openShareFailed`:toast.failure===`openMissing`?`path.openMissing`:`path.openError`)""",
+    "toast.failure===`openShareFailed`",
+    "P35c 渲染层：toast 文案按 failure 键取（含 openShareFailed）",
 )
 
 patch(
@@ -3201,7 +2916,7 @@ patch(
 )
 
 patch(
-    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    "@deepseek-ai/dsh-agent/lib/index.js",
     """		lastStepBoundary: null,
 		lastTurn: 0
 	}),
@@ -3211,9 +2926,10 @@ patch(
 		lastStep: 0
 	}),
 """,
-    "P37",
+    "lastTurn: 0,",
     "P37 区域 3：P37",
 )
+
 patch(
     "@deepseek-ai/dsh-agent-loop/lib/index.js",
     """				signal.throwIfAborted();
@@ -3223,30 +2939,32 @@ patch(
     """				signal.throwIfAborted();
 				/* P37a: a resumed or re-entered loop can carry a stale phase.step; the
 				 * session projection still knows the last step this turn actually wrote. */
-				const boundary = this.loopCtx.sessionProjections.stateOf(this.session, "turnBoundary");
+				const boundary = this.loopCtx.agents.turnBoundaryOf(this.session);
 				const step = Math.max(phase.step, boundary?.lastStep ?? 0) + 1;
 				const decision = await this.preStep(target, {
 """,
     "P37a: a resumed or re-entered loop can carry a stale phase.step; the",
     "P37 区域 1：P37a: a resumed or re-entered loop c",
 )
+
 patch(
-    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    "@deepseek-ai/dsh-agent/lib/index.js",
     """		}).nullable(),
-		lastTurn: z$1.number().int().nonnegative()
+		lastTurn: z.number().int().nonnegative()
 	}),
 """,
     """		}).nullable(),
-		lastTurn: z$1.number().int().nonnegative(),
+		lastTurn: z.number().int().nonnegative(),
 		/* P37a: the last step number written in the open turn, so a stale loop phase cannot reuse it. */
-		lastStep: z$1.number().int().nonnegative().default(0)
+		lastStep: z.number().int().nonnegative().default(0)
 	}),
 """,
-    "P37a: the last step number written in the open turn, so a stale loop phase cannot reuse it",
+    "lastStep: z.number().int().nonnegative().default(0)",
     "P37 区域 2：P37a: the last step number written i",
 )
+
 patch(
-    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    "@deepseek-ai/dsh-agent/lib/index.js",
     """				openTurnStartSeq: event.seq,
 				lastTurn: event.data.turn
 			};
@@ -3260,8 +2978,9 @@ patch(
     "P37a: a new turn restarts at step 0.",
     "P37 区域 4：P37a: a new turn restarts at step 0.",
 )
+
 patch(
-    "@deepseek-ai/dsh-agent-loop/lib/index.js",
+    "@deepseek-ai/dsh-agent/lib/index.js",
     """				lastStepStartSeq: event.seq,
 				lastStepBoundary: {
 """,
@@ -3273,6 +2992,7 @@ patch(
     "P37a: remember the step this turn actually wrote.",
     "P37 区域 5：P37a: remember the step this turn ac",
 )
+
 patch(
     "@deepseek-ai/dsh-session-format-v3-to-v4/lib/index.js",
     """*/
@@ -3544,6 +3264,9 @@ MUST_APPLY = {
         "第 ① 条的要求（能看出是哪一步失败）没落地",
     "P35c 客户端：读 502 的失败步骤（missing / 其它）":
         "不读 502 → 新加的两种文案永远显示不出来，等于白改",
+    "P35c 渲染层：toast 文案按 failure 键取（含 openShareFailed）":
+        "failure 只剩二选一 → Android 打开失败仍显示「打开失败，请重试」，"
+        "新加的两条 path.open* 文案永远显示不出来（P35c 只落地了一半）",
     "P35c 中文 toast 文案：不再一律「请重试」":
         "toast 仍回「打开失败，请重试」→ 那句误导文案还在",
 }
@@ -3624,26 +3347,26 @@ MUST_STATE = [
     # 缺了不会让产物不可用），但落盘要能一眼看出有没有打上。
     (
         "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-        "host.fileManager === \"android\"",
+        "host.fileManager===`android`",
         "客户端 isPresentedHost 必须认 android（P29）",
         "不认的话服务端答得再对，卡片也只显示「无法读取主机桌面信息 · 重试」",
     ),
     # P31 落盘形态：magic 判图要在，且三条接点都要真的接上。
     (
         "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-        "function mediaTypeFromImageHeader(bytes) {",
+        "function mediaTypeFromImageHeader(bytes){",
         "客户端必须能按 magic 判图（P31a）",
         "没有它，选择器给空 type 的截图仍然被判成「不支持的类型」",
     ),
     (
         "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-        "mediaType: await imageMediaTypeOf(file)",
+        "mediaType:await imageMediaTypeOf(file)",
         "上传的 mediaType 必须取检测结果（P31b）",
         "取 file.type 的话空 type 仍然是空/抛错，服务端按字节复核也过不去",
     ),
     (
         "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-        "const adopted = await Promise.all(files.map(adoptImageMediaType));",
+        "const adopted=await Promise.all(files.map(adoptImageMediaType));",
         "收文件闸门必须先补类型（P31c）",
         "闸门按旧 type 分类，截图会走普通文件上传，图片路径不触发",
     ),
@@ -3670,19 +3393,19 @@ MUST_STATE = [
     # P33 落盘形态：两条文案 + 新的映射。中英文都要在，且映射要真的指向新键。
     (
         "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-        "\"image.decodeFailed\": \"图片解码失败（格式异常）",
+        "\"image.decodeFailed\":`图片解码失败（格式异常）",
         "中文要有「解码失败」文案（P33a）",
         "缺了这条，解码失败只能借用「仅支持 PNG/JPG/WebP/GIF」那句",
     ),
     (
         "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-        "\"image.decodeFailed\": \"Image could not be decoded",
+        "\"image.decodeFailed\":`Image could not be decoded",
         "英文要有「解码失败」文案（P33b）",
         "英文界面会退回显示 key 本身或沿用 unsupportedType",
     ),
     (
         "@deepseek-ai/dsh-client-ui-conversation/lib/client.js",
-        "case \"INVALID_IMAGE\": return t(\"image.decodeFailed\");",
+        "case`INVALID_IMAGE`:return t(`image.decodeFailed`);",
         "INVALID_IMAGE 必须映射到解码失败文案（P33c）",
         "映射没拆的话，两条新文案都显示不出来，用户看到的还是那句误导人的话",
     ),
@@ -3690,25 +3413,25 @@ MUST_STATE = [
     # 列表失败重试、主按钮的「打开」回落都要照旧）。
     (
         "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-        "reveal: host === null || host === \"error\" ? true : host.fileManager !== \"android\",",
+        "reveal:host===null||host===`error`?true:host.fileManager!==`android`,",
         "卡片必须按 fileManager 决定是否给 reveal（P34a）",
         "不传这个标记，渲染层照旧画「显示文件位置」，Android 上点一次错一次",
     ),
     (
         "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-        "const revealOffered = kind !== \"file\" || props.reveal !== false;",
+        "const revealOffered=kind!==`file`||props.reveal!==false;",
         "渲染层必须有 revealOffered 这一层判断（P34b）",
         "没有它，主按钮在 Android 上仍然是「显示文件位置」",
     ),
     (
         "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-        "reveal: props.reveal !== false,",
+        "reveal:props.reveal!==false,",
         "卡片动作必须把 reveal 标记交给渲染层（P34d）",
         "标记丢了等于前两条没接线",
     ),
     (
         "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-        "footer: kind === \"file\" && revealOffered ? [{",
+        "footer:kind===`file`&&revealOffered?[{",
         "菜单 footer 的 reveal 项必须跟 revealOffered 走（P34c）",
         "菜单里留着 reveal，展开菜单仍然能点到那个必然失败的动作",
     ),
@@ -3716,7 +3439,7 @@ MUST_STATE = [
     # 这行后面（review 面板与卡片传的 available 来源不同，位置本身就是证据）。
     (
         "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-        "available: native,\n\t\t\t\t\t\t\t\t\t\t/* P34e: android hides reveal",
+        "available:native,reveal:host===null||host===`error`?true:host.fileManager!==`android`,",
         "review 面板那处也必须把 fileManager 判据传给插槽（P34e）",
         "不传的话 review 面板的主按钮仍是「显示文件位置」，点一次错一次",
     ),
@@ -3724,14 +3447,14 @@ MUST_STATE = [
     # 的 present.host（不是新造探测）；Android 打开失败必须带上 stage 并回 502。
     (
         "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-        "const PRESENT_HOST_ROUTE = \"api/present.host\";",
+        "const PRESENT_HOST_ROUTE=`api/present.host`;",
         "预览页必须能读到宿主的 fileManager（P35b）",
         "没有它，预览页只能靠 canOpenWorkspacePath 那个布尔，"
         "分不出「有桌面」还是「有分享面板」",
     ),
     (
         "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-        "reveal: props.reveal !== false && fileManager !== \"android\",",
+        "reveal:props.reveal!==false&&fileManager!==`android`,",
         "预览页的 reveal 必须按宿主判据决定（P35a + P35b）",
         "只转发不判据，Android 上照旧画那个必然失败的文件夹按钮",
     ),
@@ -3749,7 +3472,7 @@ MUST_STATE = [
     ),
     (
         "@deepseek-ai/dsh-client-ui-deliverables/lib/client.js",
-        "phase === \"androidOpenFailed\" ? \"openShareFailed\"",
+        "phase===`androidOpenFailed`?`openShareFailed`",
         "卡片必须把失败步骤映射成具体文案键（P35c）",
         "映射不在，新文案显示不出来，toast 又回到 openError",
     ),
@@ -3761,7 +3484,7 @@ MUST_STATE = [
     ),
     (
         "@deepseek-ai/dsh-client-ui-open-in-app/lib/client.js",
-        'shareFailed ? "openShareFailed" : "openError"',
+        'shareFailed?`openShareFailed`:`openError`',
         "预览页的打开失败也必须给出具体文案（P35c）",
         "不改的话预览页仍是「打开失败，请重试」——同一句话在两个界面上说法不一致",
     ),

@@ -1,6 +1,6 @@
 {
   "name": "dsh-attachment-maintenance",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "附件库维护：找出没有任何会话引用的内容寻址对象，把 files/<sha>/<name> 的重复拷贝换成指向 file-objects/<sha> 的链接。默认 dry-run。",
@@ -24,6 +24,6 @@
     "README.md"
   ],
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+    "@deepseek-ai/dsh-tools": ">=0.2.1 <0.3.0"
   }
 }
